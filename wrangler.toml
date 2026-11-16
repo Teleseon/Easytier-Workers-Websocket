@@ -1,0 +1,40 @@
+# wrangler.toml
+name = 'cf-workers-et-ws'
+main = "src/worker.js"
+compatibility_date = "2024-11-01"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+
+# ws目录：留空表示不限制路径，客户端填任意链接（如 wss://域名）都能连上
+# 如需固定路径，可填 "ws"（对应 wss://域名/ws）
+WS_PATH = ""
+
+# 转发，0为开启转发，1为纯P2P（只转发控制面，不转发 Data 包）
+EASYTIER_DISABLE_RELAY = "0"
+
+# 调试日志：设为 "1" 输出逐包日志（生产环境请保持 "0"）
+EASYTIER_DEBUG = "0"
+
+# Workers地域，参考README.md
+LOCATION_HINT = "apac"
+
+# 私有模式：填入与客户端相同的网络名称。留空则允许任何人连接
+EASYTIER_NETWORK_NAME = ""
+
+# 延迟优先模式：设为 "1" 开启，开启后中继发出的包会带上特权标志位，加速路由收敛
+EASYTIER_LATENCY_FIRST = "1"
+
+# 心跳与超时配置（缩短时间，解决节点不消失的问题）
+EASYTIER_HEARTBEAT_INTERVAL = "10000" # 10秒发一次心跳
+EASYTIER_CONNECTION_TIMEOUT = "25000" # 25秒无响应则踢出
+EASYTIER_SESSION_TTL_MS = "180000"
+
+[durable_objects]
+bindings = [
+  { name = "RELAY_ROOM", class_name = "RelayRoom" }
+]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["RelayRoom"]

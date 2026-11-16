@@ -1,0 +1,295 @@
+/**
+ * EasyTier WebSocket 中继房间（Durable Object）
+ *
+ * 使用 WebSocket Hibernation API：连接建立后通过 alarm 驱动心跳，
+ * 而不是 setInterval。这样 DO 在空闲时可以被休眠，避免 7×24 计费。
+ *
+ * @file relay_room.js
+ */
+
+import { parseHeader, createHeader } from './core/packet.js';
+import { PacketType, HEADER_SIZE, MY_PEER_ID } from './core/constants.js';
+import { loadProtos } from './core/protos.js';
+import { loadConfig, matchesWsPath } from './core/config.js';
+import { PeerManager } from './core/peer_manager.js';
+import { GlobalState } from './core/global_state.js';
+import { handleHandshake, handlePing, handleForwarding } from './core/basic_handlers.js';
+import { handleRpcReq, handleRpcResp } from './core/rpc_handler.js';
+import { randomU64String, wrapPacket } from './core/crypto.js';
+
+const WS_OPEN = 1;
+
+function toUint8Array(message) {
+  if (message instanceof ArrayBuffer) return new Uint8Array(message);
+  if (ArrayBuffer.isView(message)) {
+    return new Uint8Array(message.buffer, message.byteOffset, message.byteLength);
+  }
+  return null;
+}
+
+export class RelayRoom {
+  constructor(state, env) {
+    this.state = state;
+    this.env = env;
+    this.config = loadConfig(env);
+    this.types = loadProtos();
+
+    this.globalState = new GlobalState(this.config);
+    this.pm = new PeerManager(this.config, this.globalState);
+    this.pm.setTypes(this.types);
+
+    this.ctx = {
+      config: this.config,
+      types: this.types,
+      pm: this.pm,
+      globalState: this.globalState,
+    };
+
+    // 休眠恢复后 socket 上挂载的属性会丢失，统一在 _ensureSocket 中按附件重建
+    this._alarmAt = 0;
+    const sockets = this.state.getWebSockets();
+    for (const ws of sockets) {
+      this._ensureSocket(ws);
+    }
+    if (sockets.length > 0) this._scheduleAlarm();
+  }
+
+  async fetch(request) {
+    const url = new URL(request.url);
+    if (!matchesWsPath(this.config, url.pathname)) {
+      return new Response('Not found', { status: 404 });
+    }
+    if (request.headers.get('Upgrade') !== 'websocket') {
+      return new Response('Expected websocket', { status: 400 });
+    }
+
+    const pair = new WebSocketPair();
+    const client = pair[0];
+    const server = pair[1];
+
+    this.state.acceptWebSocket(server);
+    this._ensureSocket(server);
+    this._scheduleAlarm();
+
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
+  async webSocketMessage(ws, message) {
+    try {
+      this._ensureSocket(ws);
+
+      const buffer = toUint8Array(message);
+      if (!buffer) {
+        if (this.config.debug) console.warn('[ws] unsupported message type', typeof message);
+        return;
+      }
+
+      const maxPayload = this.config.maxMessageBytes;
+      if (buffer.length < HEADER_SIZE || buffer.length > maxPayload + HEADER_SIZE) {
+        if (this.config.debug) console.warn(`[ws] dropped packet with invalid size ${buffer.length}`);
+        return;
+      }
+
+      const header = parseHeader(buffer);
+      if (!header) return;
+      if (header.len > maxPayload) return;
+
+      // 声明的 payload 长度必须能被实际数据覆盖，否则视为截断报文
+      if (buffer.length - HEADER_SIZE < header.len) {
+        if (this.config.debug) {
+          console.warn(`[ws] truncated packet from=${header.fromPeerId} declared=${header.len} actual=${buffer.length - HEADER_SIZE}`);
+        }
+        return;
+      }
+
+      ws.lastSeen = Date.now();
+      const payload = buffer.subarray(HEADER_SIZE);
+
+      if (this.config.debug) {
+        console.log(`[ws] from=${header.fromPeerId} to=${header.toPeerId} type=${header.packetType} len=${header.len}`);
+      }
+
+      const toServer = !header.toPeerId || header.toPeerId === MY_PEER_ID;
+
+      switch (header.packetType) {
+        case PacketType.HandShake:
+          if (handleHandshake(ws, header, payload, this.ctx)) {
+            this._updateAttachment(ws);
+          }
+          break;
+
+        case PacketType.Ping:
+          handlePing(ws, header, payload, this.ctx);
+          break;
+
+        case PacketType.Pong:
+          ws.lastPongReceived = Date.now();
+          this._updateAttachment(ws);
+          break;
+
+        case PacketType.RpcReq:
+          if (toServer) handleRpcReq(ws, header, payload, this.ctx);
+          else handleForwarding(ws, header, buffer, this.ctx);
+          break;
+
+        case PacketType.RpcResp:
+          if (toServer) handleRpcResp(ws, header, payload, this.ctx);
+          else handleForwarding(ws, header, buffer, this.ctx);
+          break;
+
+        case PacketType.Data:
+        default:
+          handleForwarding(ws, header, buffer, this.ctx);
+          break;
+      }
+    } catch (e) {
+      // 单条报文失败不关闭连接，交给心跳超时兜底
+      console.error('relay_room message handling error:', e);
+    }
+  }
+
+  async webSocketClose(ws) {
+    this._ensureSocket(ws);
+    if (ws.cleanedUp) return;
+    ws.cleanedUp = true;
+
+    const groupKey = ws.groupKey;
+
+    if (ws.peerId) {
+      const removed = this.pm.removePeer(ws);
+      if (removed) {
+        try {
+          this.pm.broadcastRouteUpdate(this.types, groupKey, null, { forceFull: true });
+        } catch (e) {
+          if (this.config.debug) console.warn('[ws] broadcast after close failed:', e.message);
+        }
+      }
+    }
+
+    if (this.state.getWebSockets().length === 0) {
+      try {
+        await this.state.storage.deleteAlarm();
+      } catch (_) {
+        // 没有待处理 alarm 时会抛错，忽略即可
+      }
+    }
+  }
+
+  async webSocketError(ws) {
+    await this.webSocketClose(ws);
+  }
+
+  /**
+   * 心跳：用 alarm 代替 setInterval，避免 DO 因为定时器永远不休眠。
+   */
+  async alarm() {
+    this._alarmAt = 0;
+    const sockets = this.state.getWebSockets();
+    const now = Date.now();
+
+    for (const ws of sockets) {
+      this._ensureSocket(ws);
+
+      if (ws.readyState !== WS_OPEN) {
+        await this.webSocketClose(ws);
+        continue;
+      }
+
+      if (now - (ws.lastPingSent || 0) >= this.config.heartbeatIntervalMs) {
+        this._sendPing(ws);
+      }
+
+      if (now - (ws.lastPongReceived || now) > this.config.connectionTimeoutMs) {
+        if (this.config.debug) console.log(`[heartbeat] timeout peer=${ws.peerId}`);
+        await this.webSocketClose(ws);
+        try {
+          ws.close();
+        } catch (_) {
+          // 已经关闭
+        }
+      }
+    }
+
+    if (this.state.getWebSockets().length > 0) {
+      this._scheduleAlarm();
+    } else {
+      try {
+        await this.state.storage.deleteAlarm();
+      } catch (_) {
+        // 忽略
+      }
+    }
+  }
+
+  _scheduleAlarm() {
+    const interval = Math.max(1000, Math.min(this.config.heartbeatIntervalMs, 5000));
+    const now = Date.now();
+    // 已有更早的排程时不重复覆盖，避免高频建连把心跳一直往后推
+    if (this._alarmAt > now) return;
+
+    this._alarmAt = now + interval;
+    try {
+      const pending = this.state.storage.setAlarm(this._alarmAt);
+      if (pending && typeof pending.catch === 'function') pending.catch(() => {});
+    } catch (e) {
+      this._alarmAt = 0;
+      if (this.config.debug) console.warn('[alarm] schedule failed:', e.message);
+    }
+  }
+
+  _ensureSocket(ws) {
+    if (ws.__etReady) {
+      if (ws.peerId) this.pm.addPeer(ws.peerId, ws);
+      return ws;
+    }
+
+    let meta = null;
+    if (typeof ws.deserializeAttachment === 'function') {
+      meta = ws.deserializeAttachment() || null;
+    }
+    meta = meta || {};
+
+    ws.__etReady = true;
+    ws.cleanedUp = false;
+    ws.peerId = meta.peerId || null;
+    ws.groupKey = meta.groupKey || null;
+    ws.domainName = meta.domainName || null;
+    ws.serverSessionId = meta.serverSessionId || randomU64String();
+    ws.weAreInitiator = false;
+    ws.lastSeen = Date.now();
+    ws.lastPingSent = 0;
+    // 没有历史 pong 记录时以当前时间起算，避免旧实现里 0 值导致的“永久免死”
+    ws.lastPongReceived = meta.lastPongAt || Date.now();
+    ws.relayFlags = this.config.latencyFirst ? 0x02 : 0;
+
+    if (ws.peerId) this.pm.addPeer(ws.peerId, ws);
+    return ws;
+  }
+
+  _updateAttachment(ws) {
+    if (typeof ws.serializeAttachment !== 'function') return;
+    try {
+      ws.serializeAttachment({
+        peerId: ws.peerId || null,
+        groupKey: ws.groupKey || null,
+        domainName: ws.domainName || null,
+        serverSessionId: ws.serverSessionId || null,
+        lastPongAt: ws.lastPongReceived || Date.now(),
+      });
+    } catch (e) {
+      if (this.config.debug) console.warn('[ws] serializeAttachment failed:', e.message);
+    }
+  }
+
+  _sendPing(ws) {
+    ws.lastPingSent = Date.now();
+    try {
+      if (ws.readyState !== WS_OPEN) return;
+      const payload = new Uint8Array([112, 105, 110, 103]); // "ping"
+      ws.send(wrapPacket(createHeader, MY_PEER_ID, ws.peerId || 0, PacketType.Ping, payload, ws));
+      if (this.config.debug) console.log(`[heartbeat] ping peer=${ws.peerId}`);
+    } catch (e) {
+      if (this.config.debug) console.warn(`[heartbeat] ping failed peer=${ws.peerId}: ${e.message}`);
+    }
+  }
+}

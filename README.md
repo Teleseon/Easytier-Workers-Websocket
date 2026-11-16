@@ -1,0 +1,190 @@
+# Easytier-Workers-Websocket
+
+基于 Cloudflare Workers + Durable Objects 的 EasyTier WebSocket 服务端实现。使用 JavaScript 复刻 EasyTier 协议（v4）的握手、路由同步与数据转发，官方 Rust 客户端可以直接连接，无需改动任何客户端代码。
+
+> **本项目仅供学习交流使用，请勿用于商业用途或非法用途。**
+
+## 项目简介
+
+EasyTier 是一个去中心化的 P2P 组网工具，官方实现基于 Rust。本项目把 WebSocket 这一层的中继服务端搬到 Cloudflare 边缘运行时上：
+
+- 每个网络组（`network_name` + 网络密钥摘要）由一个 Durable Object 承载，组间天然隔离
+- 服务端只做控制面同步与必要的数据转发，并主动交换 STUN / 公网可达性信息帮助客户端打洞
+- 协议编解码使用 protobufjs 静态生成的代码，与官方 `.proto` 保持一致
+
+## 主要特性
+
+| 特性 | 说明 |
+|---|---|
+| 直连即用 | `WS_PATH` 留空时任意路径都接受，客户端填 `wss://你的域名` 即可，无需 `/ws` |
+| 服务器标识 | 节点列表中显示为 `Easytier-Workers-Websocket` |
+| 心跳与清理 | 主动 Ping/Pong，超时立即清理，断线节点从所有客户端列表消失 |
+| 低成本 | 心跳由 Durable Object `alarm` 驱动，没有连接时自动休眠，不产生常驻计费 |
+| 私有网络 | 配置网络名后，客户端必须使用同名网络才能加入 |
+| 延迟优先 | 特权标志位让客户端优先走本节点收敛路由 |
+| 纯 P2P 模式 | 只转发控制面，不转发 Data 包，强制客户端自行打洞 |
+| PeerCenter | 支持 PeerMap / GlobalPeerMap 查询，便于客户端做全局发现 |
+
+## 技术架构
+
+- **运行时**：Cloudflare Workers（`compatibility_date = 2024-11-01`，开启 `nodejs_compat`）
+- **状态**：Durable Object（SQLite 存储后端），单一 `RelayRoom` 类
+- **传输**：WebSocket 二进制帧，自定义 16 字节包头 + Protobuf 负载
+- **序列化**：protobufjs + long，代码位于 `src/worker/core/protos_generated.js`
+- **状态管理**：所有对等节点表、路由会话、版本号都是 `RelayRoom` 实例字段，不跨实例共享
+
+## 快速开始
+
+### 前置要求
+
+- Node.js >= 20（wrangler 4 的要求）
+- npm
+- Cloudflare 账号
+
+### 本地开发
+
+```bash
+npm install
+npx wrangler login      # 仅首次需要
+npm run dev             # 监听 0.0.0.0:8787，改代码自动热重载
+```
+
+### 部署
+
+```bash
+npx wrangler deploy
+```
+
+## 客户端连接
+
+服务端不限制路径，填一个地址即可：
+
+| 环境 | 填写 |
+|---|---|
+| 本地开发 | `ws://192.168.3.2:8787` |
+| 线上部署 | `wss://你的域名` |
+
+几点说明：
+
+- 本地开发用 `ws://`，不要用 `wss://`（本地没有 TLS）
+- 建议用局域网 IP 而不是 `127.0.0.1`：如果 EasyTier 绑定了物理网卡，连回环地址会报 `10049 AddrNotAvailable`
+- 端口填 `0` 表示使用协议默认端口（ws = 80，wss = 443）
+- 若想固定路径，把 `WS_PATH` 设成 `ws`，此时客户端要填 `wss://域名/ws`（`/ws/` 同样可用）
+
+## 环境变量
+
+在 `wrangler.toml` 的 `[vars]` 中配置：
+
+### 入口与身份
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `WS_PATH` | `""` | WebSocket 路径；留空 = 任意路径 |
+| `EASYTIER_VERSION` | `Easytier-Workers-Websocket` | 上报给客户端的版本号 |
+| `EASYTIER_HOSTNAME` | `Easytier-Workers-Websocket` | 上报给客户端的节点名 |
+| `EASYTIER_NETWORK_NAME` | `""` | 私有网络名；留空为公开服务器 |
+| `EASYTIER_PUBLIC_SERVER_NETWORK_NAME` | `public_server` | 公开服务器对外展示的网络名 |
+| `EASYTIER_NETWORK_LENGTH` | `24` | 虚拟网段前缀长度 |
+
+### 心跳与超时
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `EASYTIER_HEARTBEAT_INTERVAL` | `10000` | 心跳间隔（毫秒） |
+| `EASYTIER_CONNECTION_TIMEOUT` | `25000` | 连接超时（毫秒），超时即断开并清理 |
+| `EASYTIER_SESSION_TTL_MS` | `180000` | 路由会话状态保留时长 |
+
+### 行为开关
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `EASYTIER_LATENCY_FIRST` | `0` | `1` 开启延迟优先模式 |
+| `EASYTIER_DISABLE_RELAY` | `0` | `1` 开启纯 P2P，不转发 Data 包 |
+| `EASYTIER_DEBUG` | `0` | `1` 输出逐包调试日志 |
+| `LOCATION_HINT` | `apac` | Durable Object 部署区域 |
+| `EASYTIER_OSPF_ROUTE_METHOD_INDEX` | `1` | 下发给客户端的路由方法索引 |
+| `EASYTIER_HANDSHAKE_MODE` | `foreign` | 握手时的网络名回填策略 |
+| `EASYTIER_PEER_CENTER_TTL_MS` | `180000` | PeerCenter 缓存过期时间 |
+
+### 防护上限
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `EASYTIER_MAX_MESSAGE_BYTES` | `1048576` | 单帧报文上限（字节） |
+| `EASYTIER_MAX_PEERS_PER_GROUP` | `512` | 单个网络组最大连接数 |
+
+## Durable Object 地区
+
+Durable Object 默认就近调度。需要固定时可设置 `LOCATION_HINT`：
+
+| 值 | 地区 | 值 | 地区 |
+|---|---|---|---|
+| `wnam` | 北美西部 | `eeur` | 东欧 |
+| `enam` | 北美东部 | `apac` | 亚太（默认） |
+| `sam` | 南美 | `oc` | 大洋洲 |
+| `weur` | 西欧 | `afr` | 非洲 |
+| `me` | 中东 | | |
+
+详见 [Cloudflare 官方文档](https://developers.cloudflare.com/durable-objects/reference/data-location/)。
+
+## 项目结构
+
+```
+.
+├── protos/                     # Protocol Buffers 定义（common / error / peer_rpc）
+├── src/
+│   ├── worker.js               # Worker 入口：健康检查、路径校验、转发到 DO
+│   └── worker/
+│       ├── relay_room.js       # Durable Object：连接生命周期、心跳、分发
+│       └── core/
+│           ├── config.js       # 环境变量解析与路径匹配
+│           ├── constants.js    # 协议常量（包头、包类型、服务器 peer id）
+│           ├── packet.js       # 16 字节包头编解码
+│           ├── protos.js       # protobuf 加载
+│           ├── protos_generated.js  # pbjs 静态生成代码
+│           ├── basic_handlers.js    # 握手、Ping、数据转发
+│           ├── rpc_handler.js       # RPC 请求/响应（路由同步、PeerCenter）
+│           ├── peer_manager.js      # 节点表、连接位图、路由广播
+│           ├── global_state.js      # PeerCenter 缓存与摘要
+│           ├── compress.js          # 入站压缩体兼容处理
+│           └── crypto.js            # 随机 ID 与包头封装
+├── package.json
+├── wrangler.toml
+└── README.md
+```
+
+## 实现要点
+
+### 心跳与幽灵节点
+
+服务端每 `EASYTIER_HEARTBEAT_INTERVAL` 发一次 Ping，超过 `EASYTIER_CONNECTION_TIMEOUT` 没有 Pong 就断开并广播路由更新。定时任务由 Durable Object 的 `alarm` 驱动，房间空了会取消下一次 alarm，因此空闲时实例可以正常休眠。
+
+### 路由同步
+
+节点加入时广播一次全量路由，之后按拓扑变化增量推送。连接位图按拓扑签名缓存，避免每个目标都重建一次；版本号在进程内单调递增，杜绝重启后回退导致的客户端不刷新。
+
+### 协议兼容性
+
+- 出站 RPC 响应固定使用 `algo = 1 (None)`，不使用服务端压缩（部分客户端会按声明算法解压，标错会导致解析失败）
+- 入站若收到压缩体，会做一次尽力解压，失败则丢弃该包而不是断开连接
+- 服务器 `peer_id` 固定，客户端若冒充该 ID 会被直接拒绝
+
+## 已知限制
+
+- 只实现了服务端所需的协议子集，不包含官方 Rust 核心的完整路由与加密能力
+- 中继带宽受 Cloudflare 配额限制，纯 P2P 模式下建议开启 `EASYTIER_DISABLE_RELAY=1`
+- 项目仍在早期阶段，欢迎反馈问题
+
+## 贡献
+
+本项目在 IceSoulHanxi/easytier-ws-relay 的基础上演进，重点修复了"幽灵节点"、路由版本回退、压缩协商错误等问题。
+
+欢迎提交 Issue 和 Pull Request。
+
+## 许可证
+
+[MIT License](./LICENSE)
+
+## 免责声明
+
+本项目仅供学习交流使用，请勿用于任何商业用途或非法用途。使用本项目代码造成的任何后果，原作者概不负责。
