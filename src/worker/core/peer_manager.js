@@ -41,10 +41,14 @@ export class PeerManager {
     this.peerInfosByGroup = new Map(); // groupKey -> Map(peerId -> peerInfo)
     this.routeSessions = new Map(); // groupKey -> Map(peerId -> session)
     this.bitmapCache = new Map(); // groupKey -> { sig, bitmap }
+    // 各客户端上报的连接关系（打洞成功后由客户端自己声明），groupKey -> Map(peerId -> {edges, ts})
+    this.reportedEdges = new Map();
 
     this.types = null;
     this.myInfo = null;
     this.pureP2PMode = !!config.disableRelay;
+    // 默认全互联位图：让客户端尝试 P2P 打洞，失败才回落中继
+    this.fullMesh = config.fullMesh !== false;
     this.globalNetworkVersion = 0;
 
     this.sessionTtlMs = config.sessionTtlMs;
@@ -219,6 +223,9 @@ export class PeerManager {
       if (sessions.size === 0) this.routeSessions.delete(groupKey);
     }
 
+    const reported = this.reportedEdges.get(groupKey);
+    if (reported) reported.delete(peerId);
+
     if (peers && peers.size === 0) {
       this.peersByGroup.delete(groupKey);
       this.peerInfosByGroup.delete(groupKey);
@@ -248,19 +255,123 @@ export class PeerManager {
   }
 
   /**
-   * 生成全连接位图并缓存。
-   * 拓扑签名不变时直接复用，避免广播时为每个目标重复分配。
+   * 记录某个客户端上报的连接关系（SyncRouteInfoRequest.connBitmap）。
+   *
+   * 客户端打洞成功后，会在下一次路由同步里把自己的 conn_map 发上来（该行对应的 bit 置 1）。
+   * 服务端必须把这些边汇总进全局位图，否则路由表会永远认为「只能经中继」，
+   * 即使直连已经建好，数据仍然走中继。
+   *
+   * @returns {boolean} 汇总结果是否发生变化（变化时需要立即向其它节点广播）
    */
-  _getFullMeshBitmap(groupKey, sig, n) {
+  recordConnBitmap(groupKey, fromPeerId, connBitmap) {
+    if (!connBitmap || !Array.isArray(connBitmap.peerIds) || !connBitmap.bitmap) return false;
+
+    const peerIds = connBitmap.peerIds.map((item) => Number(item && item.peerId));
+    const n = peerIds.length;
+    if (n === 0) return false;
+
+    const bytes = connBitmap.bitmap;
+    const edges = new Set();
+    for (let i = 0; i < n; i++) {
+      for (let j = 0; j < n; j++) {
+        if (i === j) continue;
+        const bitIdx = i * n + j;
+        const byte = bytes[bitIdx >>> 3];
+        if (byte === undefined) continue;
+        if ((byte & (1 << (bitIdx & 7))) === 0) continue;
+        const a = peerIds[i];
+        const b = peerIds[j];
+        if (!Number.isFinite(a) || !Number.isFinite(b)) continue;
+        edges.add(a < b ? `${a}:${b}` : `${b}:${a}`);
+      }
+    }
+
+    const k = String(groupKey || '');
+    let group = this.reportedEdges.get(k);
+    if (!group) {
+      group = new Map();
+      this.reportedEdges.set(k, group);
+    }
+
+    const prev = group.get(fromPeerId);
+    const changed = !prev || prev.edges.size !== edges.size
+      || Array.from(edges).some((e) => !prev.edges.has(e));
+
+    group.set(fromPeerId, { edges, ts: Date.now() });
+    return changed;
+  }
+
+  /**
+   * 生成连接位图并缓存。
+   *
+   * 语义与官方实现一致：n×n 位，bit(i, j) = 1 表示 peer_ids[i] 与 peer_ids[j] 直连。
+   *
+   * 位图内容 = 服务器与各节点的直连边 + 客户端上报的直连边（打洞结果）。
+   * 客户端看到「自己与对端未直连」才会去尝试 GetIpList 打洞；
+   * 打洞成功后必须把这条边反馈给它，否则它会一直把流量交给中继。
+   *
+   * EASYTIER_FULL_MESH=1 时退化为全互联（复现原版行为，仅用于排查）。
+   */
+  _getConnBitmap(groupKey, relevantPeers) {
+    const n = relevantPeers.length;
+    const size = Math.ceil((n * n) / 8);
+
+    if (this.fullMesh) {
+      const sig = `mesh|${relevantPeers.join(',')}`;
+      const cached = this.bitmapCache.get(groupKey);
+      if (cached && cached.sig === sig) return cached.bitmap;
+
+      const bitmap = new Uint8Array(size).fill(0xff);
+      const excessBits = size * 8 - n * n;
+      if (excessBits > 0) bitmap[size - 1] &= 0xff >>> excessBits;
+      this.bitmapCache.set(groupKey, { sig, bitmap });
+      return bitmap;
+    }
+
+    const indexOf = new Map();
+    for (let i = 0; i < n; i++) indexOf.set(Number(relevantPeers[i]), i);
+
+    const bitmap = new Uint8Array(size);
+    const edges = [];
+    const setEdge = (from, to) => {
+      if (from === undefined || to === undefined || from === to) return;
+      const bitIdx = from * n + to;
+      bitmap[bitIdx >>> 3] |= 1 << (bitIdx & 7);
+      edges.push(from < to ? `${from}:${to}` : `${to}:${from}`);
+    };
+
+    // 服务器与所有直连节点互连
+    const myIdx = indexOf.get(MY_PEER_ID);
+    for (const [pid] of this.listPeersInGroup(groupKey)) {
+      const peerIdx = indexOf.get(Number(pid));
+      if (peerIdx === undefined) continue;
+      setEdge(myIdx, peerIdx);
+      setEdge(peerIdx, myIdx);
+    }
+
+    // 汇总各客户端上报的直连边（打洞成功后的结果）。
+    // 不做超时淘汰：客户端只在 conn_map 变化时才上报（其余时间是 conn_info: None），
+    // 若按时效淘汰，直连明明还在也会被误删，路由会退回中继。
+    // 边的生命周期由会话决定：节点断开时 removePeer 会清掉，连接断开时客户端会重新上报。
+    const reported = this.reportedEdges.get(String(groupKey || ''));
+    if (reported) {
+      for (const entry of reported.values()) {
+        if (!entry) continue;
+        for (const key of entry.edges) {
+          const sep = key.indexOf(':');
+          const a = indexOf.get(Number(key.slice(0, sep)));
+          const b = indexOf.get(Number(key.slice(sep + 1)));
+          if (a === undefined || b === undefined) continue;
+          setEdge(a, b);
+          setEdge(b, a);
+        }
+      }
+    }
+
+    const sig = `${relevantPeers.join(',')}|${edges.sort().join(',')}`;
     const cached = this.bitmapCache.get(groupKey);
     if (cached && cached.sig === sig) return cached.bitmap;
 
-    const size = Math.ceil((n * n) / 8);
-    const bitmap = new Uint8Array(size).fill(0xff);
-    const excessBits = size * 8 - n * n;
-    if (excessBits > 0) {
-      bitmap[size - 1] &= 0xff >>> excessBits;
-    }
     this.bitmapCache.set(groupKey, { sig, bitmap });
     return bitmap;
   }
@@ -359,8 +470,10 @@ export class PeerManager {
 
     let connBitmap = null;
     if (relevantPeers.length > 0) {
-      const sig = relevantPeers.join(',');
-      const bitmap = this._getFullMeshBitmap(groupKey, sig, relevantPeers.length);
+      const bitmap = this._getConnBitmap(groupKey, relevantPeers);
+      // 签名必须包含位图内容：打洞成功后连接关系变化，但 peer 列表不变，
+      // 若只用 peer 列表做签名，版本号不会递增，客户端会忽略这次更新。
+      const sig = `${relevantPeers.join(',')}|${Array.from(bitmap).join('.')}`;
 
       if (forceFullLocal || sig !== session.lastConnBitmapSig) {
         this._nextVersion();

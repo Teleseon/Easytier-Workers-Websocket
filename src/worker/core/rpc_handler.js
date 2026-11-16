@@ -188,9 +188,13 @@ export function handleRpcReq(ws, header, payload, ctx) {
       return;
     }
 
-    if (config.debug) {
-      console.log(`[rpc] unhandled service=${descriptor.serviceName} proto=${descriptor.protoName}`);
-    }
+    // 未处理的服务：始终记录。RPC 数量极小，而这里正是客户端打洞信令
+    // （peer_rpc.DirectConnectorRpc.GetIpList / SendUdpHolePunchPacket）会落到的分支，
+    // 常开日志便于判断客户端到底有没有发起直连尝试。
+    console.log(
+      `[rpc] unhandled service=${descriptor.serviceName} proto=${descriptor.protoName} `
+      + `method=${descriptor.methodIndex} from=${header.fromPeerId} to=${header.toPeerId}`,
+    );
   } catch (e) {
     console.error('RPC Decode error:', e);
   }
@@ -243,6 +247,9 @@ function handleSyncRouteInfo(ws, fromPeerId, reqRpcPacket, syncReq, ctx) {
     ws.weAreInitiator = !syncReq.isInitiator;
   }
   pm.onRouteSessionAck(groupKey, fromPeerId, syncReq.mySessionId, ws.weAreInitiator);
+
+  // 记录该客户端上报的连接关系（打洞成功后它会把自己的直连边发上来）
+  const bitmapChanged = pm.recordConnBitmap(groupKey, fromPeerId, syncReq.connBitmap);
 
   let hasNewPeers = false;
   let hasSubPeers = false;
@@ -304,7 +311,7 @@ function handleSyncRouteInfo(ws, fromPeerId, reqRpcPacket, syncReq, ctx) {
     if (config.debug) console.warn(`[rpc] push route update to ${fromPeerId} failed: ${e.message}`);
   }
 
-  if (hasNewPeers || hasSubPeers) {
+  if (hasNewPeers || hasSubPeers || bitmapChanged) {
     try {
       pm.broadcastRouteUpdate(types, groupKey, fromPeerId, { forceFull: true });
     } catch (e) {

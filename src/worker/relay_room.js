@@ -129,7 +129,11 @@ export class RelayRoom {
 
         case PacketType.RpcReq:
           if (toServer) handleRpcReq(ws, header, payload, this.ctx);
-          else handleForwarding(ws, header, buffer, this.ctx);
+          else {
+            // 转发 RPC 的数量很小，始终记录服务名，便于确认客户端的打洞信令
+            this._logForwardedRpc(header, payload);
+            handleForwarding(ws, header, buffer, this.ctx);
+          }
           break;
 
         case PacketType.RpcResp:
@@ -278,6 +282,19 @@ export class RelayRoom {
       });
     } catch (e) {
       if (this.config.debug) console.warn('[ws] serializeAttachment failed:', e.message);
+    }
+  }
+
+  /**
+   * 记录被转发的 RPC 服务名，用于确认客户端之间的打洞信令（如 GetIpList）是否在流动。
+   */
+  _logForwardedRpc(header, payload) {
+    try {
+      const rpc = this.types.RpcPacket.decode(payload);
+      const d = rpc.descriptor || {};
+      console.log(`[rpc-fwd] ${d.serviceName}#${d.methodIndex} ${header.fromPeerId}->${header.toPeerId}`);
+    } catch (_) {
+      // 解码失败不影响转发
     }
   }
 

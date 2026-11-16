@@ -38,6 +38,9 @@ export function loadConfig(env = {}) {
     latencyFirst: env.EASYTIER_LATENCY_FIRST === '1',
     // 纯 P2P 模式：只做控制面转发，不转发 Data 包
     disableRelay: env.EASYTIER_DISABLE_RELAY === '1',
+    // 全互联位图：让客户端尝试 P2P 打洞
+    // 默认关闭（星型，保证流量走中继）；置 1 则恢复原版的全互联行为
+    fullMesh: env.EASYTIER_FULL_MESH === '1',
 
     sessionTtlMs: toInt(env.EASYTIER_SESSION_TTL_MS, 180_000),
     peerCenterTtlMs: toInt(env.EASYTIER_PEER_CENTER_TTL_MS, 180_000),
