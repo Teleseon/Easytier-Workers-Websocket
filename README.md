@@ -8,7 +8,7 @@
 
 EasyTier 是一个去中心化的 P2P 组网工具，官方实现基于 Rust。本项目把 WebSocket 这一层的中继服务端搬到 Cloudflare 边缘运行时上：
 
-- 每个网络组（`network_name` + 网络密钥摘要）由一个 Durable Object 承载，组间天然隔离
+- 每个 `?room=` 对应一个 Durable Object，同一实例内再按网络组（`network_name` + 网络密钥摘要）隔离，跨组流量不互通
 - 服务端只做控制面同步与必要的数据转发，并主动交换 STUN / 公网可达性信息帮助客户端打洞
 - 协议编解码使用 protobufjs 静态生成的代码，与官方 `.proto` 保持一致
 
@@ -20,7 +20,7 @@ EasyTier 是一个去中心化的 P2P 组网工具，官方实现基于 Rust。�
 | 服务器标识 | 节点列表中显示为 `Easytier-Workers-Websocket` |
 | 心跳与清理 | 主动 Ping/Pong，超时立即清理，断线节点从所有客户端列表消失 |
 | 低成本 | 心跳由 Durable Object `alarm` 驱动，没有连接时自动休眠，不产生常驻计费 |
-| 私有网络 | 配置网络名后，客户端必须使用同名网络才能加入 |
+| 私有网络 | 配置网络名后只接受同名客户端；再配置网络密钥后，只有持有相同密钥的客户端才能加入 |
 | 延迟优先 | 特权标志位让客户端优先走本节点收敛路由 |
 | 打洞优先 | 先按星型下发保证可通；客户端打洞成功后上报直连关系，服务端并进位图再广播，流量自动切到 P2P，打洞失败则一直走中继 |
 | 纯 P2P 模式 | 只转发控制面，不转发 Data 包，强制客户端自行打洞 |
@@ -88,7 +88,7 @@ npx wrangler deploy
 
 | 环境 | 填写 |
 |---|---|
-| 本地开发 | `ws://192.168.3.2:8787` |
+| 本地开发 | `ws://你的局域网IP:8787` |
 | 线上部署 | `wss://你的域名` |
 
 几点说明：
@@ -97,6 +97,40 @@ npx wrangler deploy
 - 建议用局域网 IP 而不是 `127.0.0.1`：如果 EasyTier 绑定了物理网卡，连回环地址会报 `10049 AddrNotAvailable`
 - 端口填 `0` 表示使用协议默认端口（ws = 80，wss = 443）
 - 若想固定路径，把 `WS_PATH` 设成 `ws`，此时客户端要填 `wss://域名/ws`（`/ws/` 同样可用）
+
+## 私有网络与网络密钥
+
+默认是公开服务器，任何客户端都能接入。要限制访问，按「网络名 → 网络密钥」两级收紧：
+
+1. 配置网络名：只有同名客户端能加入，其它网络名握手时直接以 `4403` 关闭。
+2. 再配置网络密钥：服务端按 EasyTier 相同算法计算摘要，与客户端上报的 `network_secret_digest` 做常量时间比对，密钥不同同样以 `4403` 关闭。
+
+```toml
+# wrangler.toml
+[vars]
+EASYTIER_NETWORK_NAME = "my_net"
+```
+
+```bash
+# 密钥不要写进 wrangler.toml，用 secret 保存
+npx wrangler secret put EASYTIER_NETWORK_SECRET
+```
+
+客户端侧使用同样的网络名与密钥：
+
+```bash
+easytier-core \
+  --network-name my_net \
+  --network-secret 你的密钥 \
+  -p wss://你的域名
+```
+
+几点说明：
+
+- 密钥摘要的计算依赖网络名，因此 `EASYTIER_NETWORK_SECRET` 必须与 `EASYTIER_NETWORK_NAME` 同时配置，否则 `/healthz` 会返回 `503`。
+- 未配置密钥时服务端只把客户端上报的摘要当作分组标识：别人可以连上这个服务器，但只有网络名和摘要都一致才会进入你的组；由于摘要由客户端自行上报、可以伪造，这种模式不适合安全隔离。
+- 密钥不匹配时客户端日志表现为 `conn closed during wait handshake response`，服务端 debug 日志会打印 `network secret mismatch`。
+- 摘要算法与 EasyTier 官方实现一致（Rust `DefaultHasher`，SipHash-1-3），已在 EasyTier 2.6.4 客户端实测通过。
 
 ## 客户端侧要求（P2P 相关）
 
@@ -151,7 +185,7 @@ curl -o NUL -s -w "%{time_total}\n" https://你的域名/healthz
 
 ## 环境变量
 
-在 `wrangler.toml` 的 `[vars]` 中配置：
+普通开关放在 `wrangler.toml` 的 `[vars]` 中；密钥类变量（`EASYTIER_NETWORK_SECRET`、`EASYTIER_STATS_TOKEN`）建议用 `npx wrangler secret put` 保存，避免提交到仓库。
 
 ### 入口与身份
 
@@ -161,6 +195,7 @@ curl -o NUL -s -w "%{time_total}\n" https://你的域名/healthz
 | `EASYTIER_VERSION` | `Easytier-Workers-Websocket` | 上报给客户端的版本号 |
 | `EASYTIER_HOSTNAME` | `Easytier-Workers-Websocket` | 上报给客户端的节点名 |
 | `EASYTIER_NETWORK_NAME` | `""` | 私有网络名；留空为公开服务器 |
+| `EASYTIER_NETWORK_SECRET` | `""` | 网络密钥；配置后强制校验客户端上报的密钥摘要，只有相同密钥才能加入（需同时配置 `EASYTIER_NETWORK_NAME`，建议用 `wrangler secret put` 保存） |
 | `EASYTIER_PUBLIC_SERVER_NETWORK_NAME` | `public_server` | 公开服务器对外展示的网络名 |
 | `EASYTIER_NETWORK_LENGTH` | `24` | 虚拟网段前缀长度 |
 
@@ -177,7 +212,7 @@ curl -o NUL -s -w "%{time_total}\n" https://你的域名/healthz
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `EASYTIER_LATENCY_FIRST` | `0` | `1` 开启延迟优先模式 |
+| `EASYTIER_LATENCY_FIRST` | `0` | `1` 开启延迟优先模式（本仓库 `wrangler.toml` 默认设为 `1`） |
 | `EASYTIER_DISABLE_RELAY` | `0` | `1` 开启纯 P2P，不转发 Data 包 |
 | `EASYTIER_FULL_MESH` | `0` | `1` 强制下发全互联位图（复现旧版行为，仅排查用；会导致打洞后流量仍走中继） |
 | `EASYTIER_DEBUG` | `0` | `1` 输出逐包调试日志（会明显拉高延迟，生产勿开） |
@@ -198,25 +233,23 @@ curl -o NUL -s -w "%{time_total}\n" https://你的域名/healthz
 | `EASYTIER_MAX_DIRECT_PEERS` | `256` | 单次 PeerCenter 上报的直连节点上限 |
 | `EASYTIER_MAX_PEER_CENTER_ENTRIES` | `4096` | PeerCenter 全局表条目上限，超限淘汰最旧条目 |
 
-### 健康检查
+## 健康检查
 
-`GET /healthz` 会先做配置自检：数值型环境变量格式、`EASYTIER_CONNECTION_TIMEOUT > EASYTIER_HEARTBEAT_INTERVAL`、`WS_PATH` 字符集、`LOCATION_HINT` 地域码、`RELAY_ROOM` 绑定。全部通过返回 `200 ok`；有问题返回 `503` 和 JSON 错误列表，响应均带 `Cache-Control: no-store`。
+`GET /healthz` 会先做配置自检：数值型环境变量格式、`EASYTIER_CONNECTION_TIMEOUT > EASYTIER_HEARTBEAT_INTERVAL`、`WS_PATH` 字符集、`LOCATION_HINT` 地域码、`EASYTIER_NETWORK_SECRET` 是否配了网络名、`RELAY_ROOM` 绑定。全部通过返回 `200 ok`；有问题返回 `503` 和 JSON 错误列表，响应均带 `Cache-Control: no-store`。
 
-### 关闭码
+## 关闭码
 
 | 关闭码 | 含义 |
 |---|---|
 | `4401` | 握手非法：magic 不符、peerId 非法、密钥摘要长度不对 |
-| `4403` | 网络名不匹配（私有模式下配置了别的网络名） |
+| `4403` | 网络名不匹配（私有模式），或网络密钥摘要校验失败 |
 | `4408` | 超过 `EASYTIER_HANDSHAKE_TIMEOUT` 仍未完成握手 |
 
-### 负载统计
+## 负载统计接口
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
 | `EASYTIER_STATS_TOKEN` | `""` | `GET /stats` 的 Bearer 令牌；留空 = 不启用该接口（返回 404） |
-
-## 负载统计接口
 
 配置 `EASYTIER_STATS_TOKEN` 后，Worker 提供 `GET /stats`，返回当前中继的连接数与累计收发流量，便于自己查负载或交给监控程序采集。
 
@@ -288,6 +321,7 @@ Durable Object 默认就近调度。需要固定时可设置 `LOCATION_HINT`：
 │           ├── protos.js       # protobuf 加载
 │           ├── protos_generated.js  # pbjs 静态生成代码
 │           ├── basic_handlers.js    # 握手、Ping、数据转发
+│           ├── network_secret.js    # 网络密钥摘要（SipHash-1-3）与常量时间比较
 │           ├── rpc_handler.js       # RPC 请求/响应（路由同步、PeerCenter）
 │           ├── peer_manager.js      # 节点表、连接位图、路由广播
 │           ├── global_state.js      # PeerCenter 缓存与摘要
@@ -331,6 +365,7 @@ Durable Object 默认就近调度。需要固定时可设置 `LOCATION_HINT`：
 
 - **来源校验**：未完成握手的连接只能发握手包；任何报文都不允许使用服务端 `peer_id`，否则可以伪造路由同步或 RPC 响应影响其它节点。客户端代转其它节点的报文是允许的（`fromPeerId` 可以不是自己），这是 EasyTier 多跳中继的既有语义。
 - **分组隔离**：`groupKey = 网络名 + 网络密钥摘要`，跨组一律不转发；私有模式（`EASYTIER_NETWORK_NAME`）下网络名不匹配直接拒绝。
+- **密钥校验**：配置 `EASYTIER_NETWORK_SECRET` 后，服务端用网络名 + 密钥按 EasyTier 相同算法算出摘要，与客户端握手上报的 `network_secret_digest` 做常量时间比对，不一致立刻以 `4403` 关闭，密钥不同的客户端无法进入同名网络。摘要计算依赖网络名，二者必须同时配置。
 - **输入校验**：报文总长、头部声明长度、网络名长度（≤64）、密钥摘要长度（必须为空或 32 字节）都会校验，畸形报文直接丢弃而不是中断服务。
 - **资源上限**：单连接令牌桶限速、单组连接数上限、PeerCenter 全局表条目上限，超限丢包但不主动断连，避免一条坏连接拖垮整个房间。
 - **不允许重复握手**：已握手的连接再次握手会被忽略（不重新登记，也不断开），既防止借机切换分组绕过连接数上限，也避免客户端周期性重发握手包时被误踢下线。
@@ -338,7 +373,7 @@ Durable Object 默认就近调度。需要固定时可设置 `LOCATION_HINT`：
 
 仍需注意的限制：
 
-- 服务端**不验证网络密钥本身**（只把摘要当作分组标识），知道网络名的人可以进入同名网络。敏感场景请使用 `EASYTIER_NETWORK_NAME` 私有模式，并把网络名当作密码保管。
+- 服务端**都不配置**时是公开服务器：任何网络名、任何密钥的客户端都能握手成功，并按自己上报的「网络名 + 密钥摘要」自动分组，不同组之间互相不可见。此时只有网络名和密钥都一致才会进入同一个虚拟网络；如果自己的网络设了密钥，别人仅知道网络名进不了你的组，但摘要由客户端自行上报、可以伪造，因此敏感场景仍应配置 `EASYTIER_NETWORK_SECRET` 让服务端校验。
 - `from_peer_id` 由客户端自己填写，协议层面没有端到端身份认证；TLS 只覆盖「客户端 ↔ Cloudflare」这一段。客户端之间的信任依赖 EasyTier 自身的设计。
 - 线上务必使用 `wss://`，不要用明文的 `ws://`。
 - 如果要防止他人滥用你的 Worker 配额，建议在 Cloudflare 面板开启 Rate limiting 规则或加来源限制。

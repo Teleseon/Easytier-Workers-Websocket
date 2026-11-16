@@ -35,6 +35,9 @@ export function loadConfig(env = {}) {
 
     // 私有网络模式：非空时只接受同名网络
     networkName: typeof env.EASYTIER_NETWORK_NAME === 'string' ? env.EASYTIER_NETWORK_NAME.trim() : '',
+    // 网络密钥：配置后强制校验客户端上报的 network_secret_digest，
+    // 只有使用相同密钥的客户端才能加入（建议用 wrangler secret 保存）
+    networkSecret: typeof env.EASYTIER_NETWORK_SECRET === 'string' ? env.EASYTIER_NETWORK_SECRET : '',
     publicServerNetworkName: env.EASYTIER_PUBLIC_SERVER_NETWORK_NAME || 'public_server',
     networkLength: toInt(env.EASYTIER_NETWORK_LENGTH, 24),
     easytierVersion: env.EASYTIER_VERSION || 'Easytier-Workers-Websocket',
@@ -133,6 +136,11 @@ export function validateConfig(config, env = {}) {
 
   if (config.wsPath && !/^\/[A-Za-z0-9_\-/]*$/.test(config.wsPath)) {
     errors.push('WS_PATH 只能包含字母、数字、下划线、短横线和斜杠');
+  }
+
+  // 密钥摘要依赖网络名参与计算，缺少网络名时无法校验，也无从比对
+  if (config.networkSecret && !config.networkName) {
+    errors.push('配置 EASYTIER_NETWORK_SECRET 时必须同时配置 EASYTIER_NETWORK_NAME');
   }
 
   const hint = typeof env.LOCATION_HINT === 'string' ? env.LOCATION_HINT.trim() : '';

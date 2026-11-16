@@ -11,6 +11,7 @@
 import { MAGIC, VERSION, MY_PEER_ID, PacketType, CloseCode } from './constants.js';
 import { createHeader } from './packet.js';
 import { wrapPacket, randomU64String, sendWithStats } from './crypto.js';
+import { networkSecretDigest, timingSafeEqual } from './network_secret.js';
 
 const WS_OPEN = 1;
 
@@ -68,6 +69,20 @@ function handleHandshake(ws, header, payload, ctx) {
   if (req.networkSecretDigrest && req.networkSecretDigrest.length !== 32) {
     ws.close(CloseCode.Unauthorized, 'Invalid network secret digest');
     return false;
+  }
+
+  // 配置了网络密钥就强制校验：只有使用相同密钥的客户端才能加入同名网络。
+  // 客户端上报的是 network_secret_digest（与 EasyTier 客户端同算法），
+  // 未配置密钥时保持原行为，仅把摘要当作分组标识。
+  if (config.networkSecret) {
+    const expected = networkSecretDigest(config.networkName, config.networkSecret);
+    if (!timingSafeEqual(req.networkSecretDigrest, expected)) {
+      if (config.debug) {
+        console.warn(`[Handshake] network secret mismatch peer=${req.myPeerId} network="${clientNetworkName}"`);
+      }
+      ws.close(CloseCode.NetworkRejected, 'Network secret mismatch');
+      return false;
+    }
   }
 
   const isPublicServer = !config.networkName;
