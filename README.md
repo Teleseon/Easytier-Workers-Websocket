@@ -22,6 +22,7 @@ EasyTier 是一个去中心化的 P2P 组网工具，官方实现基于 Rust。�
 | 低成本 | 心跳由 Durable Object `alarm` 驱动，没有连接时自动休眠，不产生常驻计费 |
 | 私有网络 | 配置网络名后，客户端必须使用同名网络才能加入 |
 | 延迟优先 | 特权标志位让客户端优先走本节点收敛路由 |
+| 打洞优先 | 先按星型下发保证可通；客户端打洞成功后上报直连关系，服务端并进位图再广播，流量自动切到 P2P，打洞失败则一直走中继 |
 | 纯 P2P 模式 | 只转发控制面，不转发 Data 包，强制客户端自行打洞 |
 | PeerCenter | 支持 PeerMap / GlobalPeerMap 查询，便于客户端做全局发现 |
 
@@ -32,6 +33,19 @@ EasyTier 是一个去中心化的 P2P 组网工具，官方实现基于 Rust。�
 - **传输**：WebSocket 二进制帧，自定义 16 字节包头 + Protobuf 负载
 - **序列化**：protobufjs + long，代码位于 `src/worker/core/protos_generated.js`
 - **状态管理**：所有对等节点表、路由会话、版本号都是 `RelayRoom` 实例字段，不跨实例共享
+
+## 一键部署
+
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/Teleseon/Easytier-Workers-Websocket)
+
+点击后按提示授权 GitHub 与 Cloudflare，会自动拉取仓库、创建 Worker 并应用 `RelayRoom` Durable Object 的迁移，无需本地环境。
+
+几点说明：
+
+- 仓库目前是 **private**：只有对该仓库有访问权限的 GitHub 账号才能使用这个按钮。如果想让任何人都能一键部署，需要把仓库改成 public
+- 部署完成后到 Cloudflare 面板 → Workers → 你的 Worker → 设置 → 变量和机密，按[环境变量](#环境变量)调整 `WS_PATH`、`EASYTIER_NETWORK_NAME` 等；不填则使用 `wrangler.toml` 里的默认值
+- `WS_PATH` 留空表示任意路径都接受，客户端直接填 `wss://<你的域名>` 即可
+- Durable Object 需要迁移才能创建，首次部署由 `[[migrations]]` 自动完成；若在面板里手工建 Worker 则需自己补上绑定
 
 ## 快速开始
 
@@ -71,6 +85,15 @@ npx wrangler deploy
 - 端口填 `0` 表示使用协议默认端口（ws = 80，wss = 443）
 - 若想固定路径，把 `WS_PATH` 设成 `ws`，此时客户端要填 `wss://域名/ws`（`/ws/` 同样可用）
 
+## 客户端侧要求（P2P 相关）
+
+打洞能不能建立，**取决于客户端配置，服务端无法代劳**。常见排查顺序：
+
+1. **网络配置里必须开启 P2P**（不要勾选「禁用 P2P」）。EasyTier 客户端上报的 `disable_p2p` 为 `true` 时，它既不会发起打洞，其它节点看到这个标记也不会去连它，结果是双方一次 `GetIpList` 都不会发，节点列表永远显示 `relay(2)`。
+2. 改完客户端配置后要**断开该网络配置再重连**才生效。
+3. 打洞成功的前提是能建立直连隧道，因此候选地址的选择由客户端决定。如果两端在同一局域网，但延迟仍有几十毫秒抖动，通常是客户端挑了公网地址（`240e:` 这类 IPv6 或 WAN IPv4），或是底层链路本身是无线接入 —— 用 `ping` 对端局域网 IP 即可区分（网关 0ms 而对端几十毫秒，说明是终端侧的无线链路问题，与本服务无关）。
+4. 服务端不参与地址选择，只负责把 `GetIpList` 这类 peer→peer 的 RPC 转发出去。
+
 ## 环境变量
 
 在 `wrangler.toml` 的 `[vars]` 中配置：
@@ -100,7 +123,8 @@ npx wrangler deploy
 |---|---|---|
 | `EASYTIER_LATENCY_FIRST` | `0` | `1` 开启延迟优先模式 |
 | `EASYTIER_DISABLE_RELAY` | `0` | `1` 开启纯 P2P，不转发 Data 包 |
-| `EASYTIER_DEBUG` | `0` | `1` 输出逐包调试日志 |
+| `EASYTIER_FULL_MESH` | `0` | `1` 强制下发全互联位图（复现旧版行为，仅排查用；会导致打洞后流量仍走中继） |
+| `EASYTIER_DEBUG` | `0` | `1` 输出逐包调试日志（会明显拉高延迟，生产勿开） |
 | `LOCATION_HINT` | `apac` | Durable Object 部署区域 |
 | `EASYTIER_OSPF_ROUTE_METHOD_INDEX` | `1` | 下发给客户端的路由方法索引 |
 | `EASYTIER_HANDSHAKE_MODE` | `foreign` | 握手时的网络名回填策略 |
@@ -159,9 +183,18 @@ Durable Object 默认就近调度。需要固定时可设置 `LOCATION_HINT`：
 
 服务端每 `EASYTIER_HEARTBEAT_INTERVAL` 发一次 Ping，超过 `EASYTIER_CONNECTION_TIMEOUT` 没有 Pong 就断开并广播路由更新。定时任务由 Durable Object 的 `alarm` 驱动，房间空了会取消下一次 alarm，因此空闲时实例可以正常休眠。
 
-### 路由同步
+### 路由同步与打洞
 
 节点加入时广播一次全量路由，之后按拓扑变化增量推送。连接位图按拓扑签名缓存，避免每个目标都重建一次；版本号在进程内单调递增，杜绝重启后回退导致的客户端不刷新。
+
+连接位图是 P2P 能否生效的关键。语义是 `n×n` 位、`bit(i,j)=1` 表示两个节点直连，服务端按下面的规则生成：
+
+- 服务器与各节点的直连边（星型底座，保证任何时候数据都能经中继送达）
+- 各客户端上报的直连边（`SyncRouteInfoRequest.conn_bitmap`）
+
+客户端打洞成功后会在下一次路由同步里带上自己的 `conn_map`，服务端把它并入全局位图并立即广播，其它节点据此把 `next_hop` 指向对端，数据面从「经中继」切到「直连」。这些边不做超时淘汰，生命周期跟随会话：客户端只在连接关系变化时才上报，若按时效淘汰，直连明明还在也会被误删，路由会退回中继。
+
+位图签名包含位图内容本身，否则「peer 列表不变但连接关系变化」时版本号不递增，客户端会忽略这次更新。
 
 ### 协议兼容性
 
@@ -173,11 +206,9 @@ Durable Object 默认就近调度。需要固定时可设置 `LOCATION_HINT`：
 
 - 只实现了服务端所需的协议子集，不包含官方 Rust 核心的完整路由与加密能力
 - 中继带宽受 Cloudflare 配额限制，纯 P2P 模式下建议开启 `EASYTIER_DISABLE_RELAY=1`
+- 打洞与地址选择完全由客户端决定，服务端只转发信令。客户端未开启 P2P、或底层链路本身抖动（典型是全无线接入）时，表现出来的高延迟与本服务无关，先用 `ping` 对端局域网 IP 排除
 - 项目仍在早期阶段，欢迎反馈问题
 
-## 贡献
-
-本项目在 IceSoulHanxi/easytier-ws-relay 的基础上演进，重点修复了"幽灵节点"、路由版本回退、压缩协商错误等问题。
 
 欢迎提交 Issue 和 Pull Request。
 
