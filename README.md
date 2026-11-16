@@ -42,7 +42,6 @@ EasyTier 是一个去中心化的 P2P 组网工具，官方实现基于 Rust。�
 
 几点说明：
 
-- 仓库目前是 **private**：只有对该仓库有访问权限的 GitHub 账号才能使用这个按钮。如果想让任何人都能一键部署，需要把仓库改成 public
 - 部署完成后到 Cloudflare 面板 → Workers → 你的 Worker → 设置 → 变量和机密，按[环境变量](#环境变量)调整 `WS_PATH`、`EASYTIER_NETWORK_NAME` 等；不填则使用 `wrangler.toml` 里的默认值
 - `WS_PATH` 留空表示任意路径都接受，客户端直接填 `wss://<你的域名>` 即可
 - Durable Object 需要迁移才能创建，首次部署由 `[[migrations]]` 自动完成；若在面板里手工建 Worker 则需自己补上绑定
