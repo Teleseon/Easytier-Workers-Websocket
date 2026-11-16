@@ -15,7 +15,7 @@
 
 import { MY_PEER_ID, PacketType } from './constants.js';
 import { createHeader } from './packet.js';
-import { wrapPacket, randomU64String } from './crypto.js';
+import { wrapPacket, randomU64String, sendWithStats } from './crypto.js';
 
 const WS_OPEN = 1;
 
@@ -521,7 +521,7 @@ export class PeerManager {
     };
 
     const rpcPacketBytes = types.RpcPacket.encode(rpcReqPacket).finish();
-    ws.send(wrapPacket(createHeader, MY_PEER_ID, targetPeerId, PacketType.RpcReq, rpcPacketBytes, ws));
+    sendWithStats(ws, wrapPacket(createHeader, MY_PEER_ID, targetPeerId, PacketType.RpcReq, rpcPacketBytes, ws));
   }
 
   _makeStubPeerInfo(peerId, networkLength) {

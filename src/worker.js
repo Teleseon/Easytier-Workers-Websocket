@@ -4,12 +4,70 @@ import { loadConfig, matchesWsPath } from './worker/core/config.js';
 
 export { RelayRoom };
 
+/** 把 room 参数收敛到安全字符集，避免用畸形值映射到任意 Durable Object 实例名 */
+function normalizeRoom(raw) {
+  return /^[A-Za-z0-9_-]{1,64}$/.test(raw) ? raw : 'default';
+}
+
+/** 解析 Authorization: Bearer <token> */
+function bearerToken(request) {
+  const h = request.headers.get('Authorization') || '';
+  const m = /^Bearer\s+(.+)$/i.exec(h);
+  return m ? m[1].trim() : '';
+}
+
+/** 常量时间比较令牌，避免通过响应耗时逐字符猜测 */
+async function tokenMatches(provided, expected) {
+  const enc = new TextEncoder();
+  const [a, b] = await Promise.all([
+    crypto.subtle.digest('SHA-256', enc.encode(provided)),
+    crypto.subtle.digest('SHA-256', enc.encode(expected)),
+  ]);
+  const x = new Uint8Array(a);
+  const y = new Uint8Array(b);
+  let diff = 0;
+  for (let i = 0; i < x.length; i++) diff |= x[i] ^ y[i];
+  return diff === 0;
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
     if (url.pathname === '/healthz') {
       return new Response('ok', { status: 200 });
+    }
+
+    // 负载统计：未配置 EASYTIER_STATS_TOKEN 时视为未启用，直接 404（不泄露该接口存在）
+    if (url.pathname === '/stats') {
+      const expected = typeof env.EASYTIER_STATS_TOKEN === 'string' ? env.EASYTIER_STATS_TOKEN.trim() : '';
+      if (!expected) {
+        return new Response('Not found', { status: 404 });
+      }
+      if (request.method !== 'GET') {
+        return new Response('Method not allowed', { status: 405, headers: { Allow: 'GET' } });
+      }
+      const provided = bearerToken(request);
+      if (!provided || !(await tokenMatches(provided, expected))) {
+        return new Response('Forbidden', { status: 403 });
+      }
+
+      const roomId = normalizeRoom(url.searchParams.get('room') || 'default');
+      const options = env.LOCATION_HINT ? { locationHint: env.LOCATION_HINT } : {};
+      const roomStub = env.RELAY_ROOM.get(env.RELAY_ROOM.idFromName(roomId), options);
+
+      // 用独立的内部路径转发给 DO，避免与 WebSocket 入口混淆
+      const statsUrl = new URL(request.url);
+      statsUrl.pathname = '/__stats';
+      statsUrl.search = `?room=${encodeURIComponent(roomId)}`;
+      const resp = await roomStub.fetch(new Request(statsUrl.toString(), { method: 'GET' }));
+      return new Response(resp.body, {
+        status: resp.status,
+        headers: {
+          'Content-Type': resp.headers.get('Content-Type') || 'application/json; charset=utf-8',
+          'Cache-Control': 'no-store',
+        },
+      });
     }
 
     const config = loadConfig(env);
@@ -21,9 +79,7 @@ export default {
       return new Response('Expected WebSocket upgrade', { status: 400 });
     }
 
-    // room 只允许安全字符，避免用畸形值映射到任意 Durable Object 实例名
-    const rawRoom = url.searchParams.get('room') || 'default';
-    const roomId = /^[A-Za-z0-9_-]{1,64}$/.test(rawRoom) ? rawRoom : 'default';
+    const roomId = normalizeRoom(url.searchParams.get('room') || 'default');
     const options = env.LOCATION_HINT ? { locationHint: env.LOCATION_HINT } : {};
     const roomStub = env.RELAY_ROOM.get(env.RELAY_ROOM.idFromName(roomId), options);
     return roomStub.fetch(request);

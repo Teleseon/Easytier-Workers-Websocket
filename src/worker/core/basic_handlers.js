@@ -10,7 +10,7 @@
 
 import { MAGIC, VERSION, MY_PEER_ID, PacketType } from './constants.js';
 import { createHeader } from './packet.js';
-import { wrapPacket, randomU64String } from './crypto.js';
+import { wrapPacket, randomU64String, sendWithStats } from './crypto.js';
 
 const WS_OPEN = 1;
 
@@ -93,7 +93,7 @@ function handleHandshake(ws, header, payload, ctx) {
     networkSecretDigrest: new Uint8Array(32),
   };
   const respBuffer = types.HandshakeRequest.encode(respPayload).finish();
-  ws.send(wrapPacket(createHeader, MY_PEER_ID, req.myPeerId, PacketType.HandShake, respBuffer, ws));
+  sendWithStats(ws, wrapPacket(createHeader, MY_PEER_ID, req.myPeerId, PacketType.HandShake, respBuffer, ws));
 
   pm.updatePeerInfo(ws.groupKey, req.myPeerId, {
     peerId: req.myPeerId,
@@ -119,7 +119,7 @@ function handleHandshake(ws, header, payload, ctx) {
 
 function handlePing(ws, header, payload, ctx) {
   const msg = wrapPacket(createHeader, MY_PEER_ID, header.fromPeerId, PacketType.Pong, payload, ws);
-  ws.send(msg);
+  sendWithStats(ws, msg);
 }
 
 function handleForwarding(sourceWs, header, fullMessage, ctx) {
@@ -140,7 +140,7 @@ function handleForwarding(sourceWs, header, fullMessage, ctx) {
   }
 
   try {
-    targetWs.send(fullMessage);
+    sendWithStats(targetWs, fullMessage);
   } catch (e) {
     pm.removePeer(targetWs);
     try {

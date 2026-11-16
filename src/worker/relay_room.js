@@ -15,7 +15,7 @@ import { PeerManager } from './core/peer_manager.js';
 import { GlobalState } from './core/global_state.js';
 import { handleHandshake, handlePing, handleForwarding } from './core/basic_handlers.js';
 import { handleRpcReq, handleRpcResp } from './core/rpc_handler.js';
-import { randomU64String, wrapPacket } from './core/crypto.js';
+import { randomU64String, wrapPacket, sendWithStats } from './core/crypto.js';
 
 const WS_OPEN = 1;
 
@@ -47,6 +47,7 @@ export class RelayRoom {
 
     // 休眠恢复后 socket 上挂载的属性会丢失，统一在 _ensureSocket 中按附件重建
     this._alarmAt = 0;
+    this.startedAt = Date.now();
     const sockets = this.state.getWebSockets();
     for (const ws of sockets) {
       this._ensureSocket(ws);
@@ -56,6 +57,10 @@ export class RelayRoom {
 
   async fetch(request) {
     const url = new URL(request.url);
+    // 内部统计路径：仅由入口 Worker 在令牌校验通过后转发进来
+    if (url.pathname === '/__stats') {
+      return this._statsResponse(url);
+    }
     if (!matchesWsPath(this.config, url.pathname)) {
       return new Response('Not found', { status: 404 });
     }
@@ -103,6 +108,8 @@ export class RelayRoom {
       }
 
       ws.lastSeen = Date.now();
+      ws.stats.msgsIn += 1;
+      ws.stats.bytesIn += buffer.length;
       const payload = buffer.subarray(HEADER_SIZE);
 
       // 单连接吞吐上限：超出预算的报文直接丢弃（不断连接），避免一条连接打满 DO
@@ -238,6 +245,9 @@ export class RelayRoom {
           // 已经关闭
         }
       }
+
+      // 顺便把统计计数写回附件（最多滞后一个心跳周期），避免休眠唤醒后丢失
+      this._updateAttachment(ws);
     }
 
     if (this.state.getWebSockets().length > 0) {
@@ -295,6 +305,16 @@ export class RelayRoom {
     ws.bucket = 0;
     ws.bucketAt = 0;
 
+    // 累计流量统计：休眠恢复时从 attachment 还原，避免每次唤醒都从 0 重新计数
+    const st = meta.stats || {};
+    ws.stats = {
+      bytesIn: st.bytesIn || 0,
+      bytesOut: st.bytesOut || 0,
+      msgsIn: st.msgsIn || 0,
+      msgsOut: st.msgsOut || 0,
+      connectedAt: st.connectedAt || Date.now(),
+    };
+
     if (ws.peerId) this.pm.addPeer(ws.peerId, ws);
     return ws;
   }
@@ -308,6 +328,16 @@ export class RelayRoom {
         domainName: ws.domainName || null,
         serverSessionId: ws.serverSessionId || null,
         lastPongAt: ws.lastPongReceived || Date.now(),
+        // 计数随附件一起持久化，休眠唤醒后不会归零
+        stats: ws.stats
+          ? {
+            bytesIn: ws.stats.bytesIn,
+            bytesOut: ws.stats.bytesOut,
+            msgsIn: ws.stats.msgsIn,
+            msgsOut: ws.stats.msgsOut,
+            connectedAt: ws.stats.connectedAt,
+          }
+          : undefined,
       });
     } catch (e) {
       if (this.config.debug) console.warn('[ws] serializeAttachment failed:', e.message);
@@ -350,12 +380,87 @@ export class RelayRoom {
     }
   }
 
+  /**
+   * 汇总本房间的负载统计，供入口 Worker 的 /stats 接口返回（令牌在入口校验）。
+   * 只统计已完成握手的连接：未握手的连接没有 peerId，无法对应到具体节点。
+   * 计数为当前 Durable Object 实例内的累计值，休眠恢复时从附件还原。
+   */
+  _statsResponse(url) {
+    const now = Date.now();
+    const room = url.searchParams.get('room') || 'default';
+    const peers = [];
+    const groups = new Map();
+    const totals = { peerCount: 0, bytesIn: 0, bytesOut: 0, msgsIn: 0, msgsOut: 0 };
+
+    for (const ws of this.state.getWebSockets()) {
+      this._ensureSocket(ws);
+      if (!ws.peerId) continue;
+
+      const st = ws.stats;
+      const groupKey = ws.groupKey ? String(ws.groupKey) : '';
+      const sep = groupKey.indexOf(':');
+      const networkName = ws.domainName || (sep > 0 ? groupKey.slice(0, sep) : '');
+      const digest = sep >= 0 ? groupKey.slice(sep + 1) : '';
+      // 只暴露密钥摘要前缀，不把完整摘要交给调用方
+      const group = `${networkName || 'anonymous'}#${digest.slice(0, 8) || 'unknown'}`;
+
+      peers.push({
+        peerId: String(ws.peerId),
+        group,
+        networkName,
+        connectedAt: st.connectedAt,
+        lastSeen: ws.lastSeen || 0,
+        bytesIn: st.bytesIn,
+        bytesOut: st.bytesOut,
+        msgsIn: st.msgsIn,
+        msgsOut: st.msgsOut,
+      });
+
+      let g = groups.get(group);
+      if (!g) {
+        g = { group, networkName, peerCount: 0, bytesIn: 0, bytesOut: 0, msgsIn: 0, msgsOut: 0 };
+        groups.set(group, g);
+      }
+      g.peerCount += 1;
+      g.bytesIn += st.bytesIn;
+      g.bytesOut += st.bytesOut;
+      g.msgsIn += st.msgsIn;
+      g.msgsOut += st.msgsOut;
+
+      totals.peerCount += 1;
+      totals.bytesIn += st.bytesIn;
+      totals.bytesOut += st.bytesOut;
+      totals.msgsIn += st.msgsIn;
+      totals.msgsOut += st.msgsOut;
+    }
+
+    // 流量大的排在前面，方便直接看出谁在占带宽
+    peers.sort((a, b) => (b.bytesIn + b.bytesOut) - (a.bytesIn + a.bytesOut));
+
+    const body = {
+      room,
+      startedAt: this.startedAt,
+      uptimeMs: now - this.startedAt,
+      generatedAt: now,
+      totals,
+      groups: Array.from(groups.values()),
+      peers,
+    };
+    return new Response(JSON.stringify(body), {
+      status: 200,
+      headers: {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Cache-Control': 'no-store',
+      },
+    });
+  }
+
   _sendPing(ws) {
     ws.lastPingSent = Date.now();
     try {
       if (ws.readyState !== WS_OPEN) return;
       const payload = new Uint8Array([112, 105, 110, 103]); // "ping"
-      ws.send(wrapPacket(createHeader, MY_PEER_ID, ws.peerId || 0, PacketType.Ping, payload, ws));
+      sendWithStats(ws, wrapPacket(createHeader, MY_PEER_ID, ws.peerId || 0, PacketType.Ping, payload, ws));
       if (this.config.debug) console.log(`[heartbeat] ping peer=${ws.peerId}`);
     } catch (e) {
       if (this.config.debug) console.warn(`[heartbeat] ping failed peer=${ws.peerId}: ${e.message}`);

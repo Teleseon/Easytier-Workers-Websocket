@@ -196,6 +196,53 @@ curl -o NUL -s -w "%{time_total}\n" https://你的域名/healthz
 | `EASYTIER_MAX_DIRECT_PEERS` | `256` | 单次 PeerCenter 上报的直连节点上限 |
 | `EASYTIER_MAX_PEER_CENTER_ENTRIES` | `4096` | PeerCenter 全局表条目上限，超限淘汰最旧条目 |
 
+### 负载统计
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `EASYTIER_STATS_TOKEN` | `""` | `GET /stats` 的 Bearer 令牌；留空 = 不启用该接口（返回 404） |
+
+## 负载统计接口
+
+配置 `EASYTIER_STATS_TOKEN` 后，Worker 提供 `GET /stats`，返回当前中继的连接数与累计收发流量，便于自己查负载或交给监控程序采集。
+
+```bash
+# 通过 secret 配置（推荐，不会写进 wrangler.toml）
+npx wrangler secret put EASYTIER_STATS_TOKEN
+
+curl -H "Authorization: Bearer 你的令牌" "https://你的域名/stats?room=default"
+```
+
+- 未配置 `EASYTIER_STATS_TOKEN` 时返回 `404`，等同于未启用，也不暴露该接口是否存在。
+- 令牌放在 `Authorization: Bearer` 头里，服务端先 SHA-256 再定长比较。
+- `?room=` 指定房间，默认 `default`；不认识的值会回落到 `default`。
+- 只统计已完成握手的连接（未握手的连接没有 `peerId`）。
+
+响应示例（节选）：
+
+```json
+{
+  "room": "default",
+  "startedAt": 1763260000000,
+  "uptimeMs": 3600000,
+  "generatedAt": 1763263600000,
+  "totals": { "peerCount": 2, "bytesIn": 1048576, "bytesOut": 2097152, "msgsIn": 4096, "msgsOut": 8192 },
+  "groups": [
+    { "group": "public_server#a1b2c3d4", "networkName": "public_server", "peerCount": 2, "bytesIn": 1048576, "bytesOut": 2097152, "msgsIn": 4096, "msgsOut": 8192 }
+  ],
+  "peers": [
+    { "peerId": "123456789", "group": "public_server#a1b2c3d4", "networkName": "public_server", "connectedAt": 1763260000000, "lastSeen": 1763263599000, "bytesIn": 524288, "bytesOut": 1048576, "msgsIn": 2048, "msgsOut": 4096 }
+  ]
+}
+```
+
+几点说明：
+
+- `bytesIn` / `bytesOut` 是 WebSocket 报文大小的累计值（含中继转发的数据面），不是 Cloudflare 计费口径；`msgsIn` / `msgsOut` 是报文条数。
+- 计数随连接附件持久化（每次 alarm 心跳回写一次，最长滞后约 5 秒）；Durable Object 被重新调度后从最后一次落盘值继续，`startedAt` / `uptimeMs` 会按新实例重新计算。
+- `group` 里的密钥摘要只保留前 8 位，不把完整摘要交给调用方。
+- `peers` 按收发总量从大到小排序，便于直接看出是谁在占带宽。
+
 ## Durable Object 地区
 
 Durable Object 默认就近调度。需要固定时可设置 `LOCATION_HINT`：
@@ -216,7 +263,7 @@ Durable Object 默认就近调度。需要固定时可设置 `LOCATION_HINT`：
 .
 ├── protos/                     # Protocol Buffers 定义（common / error / peer_rpc）
 ├── src/
-│   ├── worker.js               # Worker 入口：健康检查、路径校验、转发到 DO
+│   ├── worker.js               # Worker 入口：健康检查、/stats 统计、路径校验、转发到 DO
 │   └── worker/
 │       ├── relay_room.js       # Durable Object：连接生命周期、心跳、分发
 │       └── core/
@@ -230,7 +277,7 @@ Durable Object 默认就近调度。需要固定时可设置 `LOCATION_HINT`：
 │           ├── peer_manager.js      # 节点表、连接位图、路由广播
 │           ├── global_state.js      # PeerCenter 缓存与摘要
 │           ├── compress.js          # 入站压缩体兼容处理
-│           └── crypto.js            # 随机 ID 与包头封装
+│           └── crypto.js            # 随机 ID、包头封装与发送流量统计
 ├── package.json
 ├── wrangler.toml
 └── README.md

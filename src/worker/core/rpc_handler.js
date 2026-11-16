@@ -14,7 +14,7 @@
 
 import { MY_PEER_ID, PacketType } from './constants.js';
 import { createHeader } from './packet.js';
-import { wrapPacket, randomU64String } from './crypto.js';
+import { wrapPacket, randomU64String, sendWithStats } from './crypto.js';
 import { gunzipMaybe } from './compress.js';
 import { calcPeerCenterDigest, buildPeerCenterResponseMap } from './global_state.js';
 
@@ -76,7 +76,7 @@ function sendRpcResponse(ws, toPeerId, reqRpcPacket, types, responseBodyBytes) {
 
   const rpcPacketBytes = types.RpcPacket.encode(rpcRespPacket).finish();
   const buf = wrapPacket(createHeader, MY_PEER_ID, toPeerId, PacketType.RpcResp, rpcPacketBytes, ws);
-  ws.send(buf);
+  sendWithStats(ws, buf);
 }
 
 /** 入站压缩体只有 algo > 1 时需要处理；不支持时丢弃该报文 */

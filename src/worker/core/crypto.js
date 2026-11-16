@@ -38,3 +38,22 @@ export function wrapPacket(createHeader, fromPeerId, toPeerId, packetType, paylo
   out.set(body, headerBuf.length);
   return out;
 }
+
+/**
+ * 发送报文并累计出向流量。
+ *
+ * ws.stats 由 relay_room 在连接建立（或休眠恢复）时初始化；
+ * 统计失败不应影响正常发送，因此单独 try 包裹。
+ */
+export function sendWithStats(ws, data) {
+  try {
+    let bytes = 0;
+    if (typeof data === 'string') bytes = new TextEncoder().encode(data).length;
+    else if (data && data.byteLength !== undefined) bytes = data.byteLength;
+    ws.stats.msgsOut += 1;
+    ws.stats.bytesOut += bytes;
+  } catch (_) {
+    // 没有统计对象时照常发送
+  }
+  return ws.send(data);
+}
