@@ -51,7 +51,7 @@ EasyTier 是一个去中心化的 P2P 组网工具，官方实现基于 Rust。�
 
 ### 前置要求
 
-- Node.js >= 20（wrangler 4 的要求）
+- Node.js >= 22.12（wrangler 4 的最低要求）
 - npm
 - Cloudflare 账号
 
