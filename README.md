@@ -65,7 +65,21 @@ npm run dev             # 监听 0.0.0.0:8787，改代码自动热重载
 
 ### 部署
 
+#### 方式一：GitHub Actions（推送到 main 即自动部署）
+
+仓库自带 `.github/workflows/deploy.yml`，推送到 `main` 或手动触发 `Deploy to Cloudflare Workers` 就会自动部署。
+
+需要在 **GitHub 仓库 → Settings → Secrets and variables → Actions** 里添加两个 secret：
+
+| Secret | 说明 |
+|---|---|
+| `CLOUDFLARE_API_TOKEN` | Cloudflare 面板 → 我的个人资料 → API 令牌 → 创建令牌，选「编辑 Cloudflare Workers」模板 |
+| `CLOUDFLARE_ACCOUNT_ID` | Cloudflare 面板首页右侧的 Account ID |
+
+#### 方式二：本地部署
+
 ```bash
+npx wrangler login
 npx wrangler deploy
 ```
 
