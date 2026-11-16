@@ -131,9 +131,12 @@ export class RelayRoom {
 
       switch (header.packetType) {
         case PacketType.HandShake:
-          // 已握手的连接不允许再次握手，否则可借机切换分组绕过连接数上限
+          // 已握手的连接不允许重新握手（否则可借切换分组绕过连接数上限），
+          // 但只做忽略、不主动断开：部分客户端会周期性重发握手包，断开会导致反复重连
           if (ws.peerId) {
-            ws.close(1008, 'Duplicate handshake');
+            if (this.config.debug) {
+              console.warn(`[ws] ignored duplicate handshake from ${ws.peerId}`);
+            }
             break;
           }
           if (handleHandshake(ws, header, payload, this.ctx)) {
