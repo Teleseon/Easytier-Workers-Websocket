@@ -169,7 +169,8 @@ curl -o NUL -s -w "%{time_total}\n" https://你的域名/healthz
 | 变量 | 默认值 | 说明 |
 |---|---|---|
 | `EASYTIER_HEARTBEAT_INTERVAL` | `10000` | 心跳间隔（毫秒） |
-| `EASYTIER_CONNECTION_TIMEOUT` | `25000` | 连接超时（毫秒），超时即断开并清理 |
+| `EASYTIER_CONNECTION_TIMEOUT` | `25000` | 连接超时（毫秒），超时即断开并清理；必须大于心跳间隔 |
+| `EASYTIER_HANDSHAKE_TIMEOUT` | `10000` | 握手超时（毫秒），超时未完成握手以 `4408` 关闭 |
 | `EASYTIER_SESSION_TTL_MS` | `180000` | 路由会话状态保留时长 |
 
 ### 行为开关
@@ -191,9 +192,23 @@ curl -o NUL -s -w "%{time_total}\n" https://你的域名/healthz
 |---|---|---|
 | `EASYTIER_MAX_MESSAGE_BYTES` | `1048576` | 单帧报文上限（字节） |
 | `EASYTIER_MAX_PEERS_PER_GROUP` | `512` | 单个网络组最大连接数 |
-| `EASYTIER_MAX_BYTES_PER_SEC` | `16777216` | 单连接吞吐上限（字节/秒），超出部分丢弃 |
+| `EASYTIER_MAX_BYTES_PER_SEC` | `16777216` | 单连接入向吞吐上限（字节/秒），超出部分丢弃 |
+| `EASYTIER_MAX_OUT_BYTES_PER_SEC` | `33554432` | 单连接出向上限（字节/秒，1 秒滚动窗口），超出报文丢弃、不断连接 |
+| `EASYTIER_MAX_OUT_FRAMES_PER_SEC` | `4096` | 单连接出向帧数上限（帧/秒），防广播风暴与慢客户端堆积 |
 | `EASYTIER_MAX_DIRECT_PEERS` | `256` | 单次 PeerCenter 上报的直连节点上限 |
 | `EASYTIER_MAX_PEER_CENTER_ENTRIES` | `4096` | PeerCenter 全局表条目上限，超限淘汰最旧条目 |
+
+### 健康检查
+
+`GET /healthz` 会先做配置自检：数值型环境变量格式、`EASYTIER_CONNECTION_TIMEOUT > EASYTIER_HEARTBEAT_INTERVAL`、`WS_PATH` 字符集、`LOCATION_HINT` 地域码、`RELAY_ROOM` 绑定。全部通过返回 `200 ok`；有问题返回 `503` 和 JSON 错误列表，响应均带 `Cache-Control: no-store`。
+
+### 关闭码
+
+| 关闭码 | 含义 |
+|---|---|
+| `4401` | 握手非法：magic 不符、peerId 非法、密钥摘要长度不对 |
+| `4403` | 网络名不匹配（私有模式下配置了别的网络名） |
+| `4408` | 超过 `EASYTIER_HANDSHAKE_TIMEOUT` 仍未完成握手 |
 
 ### 负载统计
 

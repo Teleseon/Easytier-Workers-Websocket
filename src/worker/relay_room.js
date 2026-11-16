@@ -8,7 +8,7 @@
  */
 
 import { parseHeader, createHeader } from './core/packet.js';
-import { PacketType, HEADER_SIZE, MY_PEER_ID } from './core/constants.js';
+import { PacketType, HEADER_SIZE, MY_PEER_ID, CloseCode } from './core/constants.js';
 import { loadProtos } from './core/protos.js';
 import { loadConfig, matchesWsPath } from './core/config.js';
 import { PeerManager } from './core/peer_manager.js';
@@ -18,6 +18,8 @@ import { handleRpcReq, handleRpcResp } from './core/rpc_handler.js';
 import { randomU64String, wrapPacket, sendWithStats } from './core/crypto.js';
 
 const WS_OPEN = 1;
+// 加密报文的 AEAD 尾巴：12 字节 nonce + 16 字节 tag，长度校验时需扣除
+const AEAD_TAIL_BYTES = 28;
 
 function toUint8Array(message) {
   if (message instanceof ArrayBuffer) return new Uint8Array(message);
@@ -90,7 +92,7 @@ export class RelayRoom {
       }
 
       const maxPayload = this.config.maxMessageBytes;
-      if (buffer.length < HEADER_SIZE || buffer.length > maxPayload + HEADER_SIZE) {
+      if (buffer.length < HEADER_SIZE || buffer.length > maxPayload + HEADER_SIZE + AEAD_TAIL_BYTES) {
         if (this.config.debug) console.warn(`[ws] dropped packet with invalid size ${buffer.length}`);
         return;
       }
@@ -99,10 +101,15 @@ export class RelayRoom {
       if (!header) return;
       if (header.len > maxPayload) return;
 
-      // 声明的 payload 长度必须能被实际数据覆盖，否则视为截断报文
-      if (buffer.length - HEADER_SIZE < header.len) {
+      // 声明的 payload 长度必须与实际数据严格对应：
+      // 明文时 actual == header.len；加密报文（客户端开启 secure_mode）会多 28 字节
+      // 的 AEAD 尾（12 字节 nonce + 16 字节 tag），此时 actual == header.len + 28。
+      // 其余情况一律视为截断或夹带报文丢弃。
+      const actualPayload = buffer.length - HEADER_SIZE;
+      const tailBytes = actualPayload - header.len;
+      if (tailBytes !== 0 && tailBytes !== AEAD_TAIL_BYTES) {
         if (this.config.debug) {
-          console.warn(`[ws] truncated packet from=${header.fromPeerId} declared=${header.len} actual=${buffer.length - HEADER_SIZE}`);
+          console.warn(`[ws] dropped length mismatch from=${header.fromPeerId} declared=${header.len} actual=${actualPayload}`);
         }
         return;
       }
@@ -120,12 +127,29 @@ export class RelayRoom {
         return;
       }
 
+      // EasyTier 客户端回应 Ping 时会把请求头里的 fromPeerId 原样带回（数值等于服务端 ID，
+      // toPeerId 又指回自己），因此 Pong 必须在“禁止冒充服务端”检查之前处理：
+      // 它只是连接级心跳应答、不参与转发，若当作冒充丢弃，服务端永远收不到 pong，
+      // 25 秒后会被误判超时并主动断开，表现为客户端反复掉线重连。
+      if (header.packetType === PacketType.Pong) {
+        ws.lastPongReceived = Date.now();
+        // 用本次 Ping 的发送时间估算中继↔客户端 RTT，异常值（非正数或超过超时）丢弃
+        if (ws.lastPingSent) {
+          const rtt = ws.lastPongReceived - ws.lastPingSent;
+          if (rtt > 0 && rtt <= this.config.connectionTimeoutMs) {
+            ws.rttMs = rtt;
+          }
+        }
+        this._updateAttachment(ws);
+        return;
+      }
+
       // 禁止冒充服务端身份：客户端之间会互相转发其它节点的报文（fromPeerId 可以不是自己），
       // 所以不能要求 fromPeerId 等于本连接的身份，但任何情况下都不允许使用服务端 MY_PEER_ID，
       // 否则可以伪造控制面报文（路由同步 / RPC 响应）影响其它节点。
       if (Number(header.fromPeerId) === MY_PEER_ID) {
         if (this.config.debug) {
-          console.warn(`[ws] dropped packet impersonating server from session=${ws.peerId}`);
+          console.warn(`[ws] dropped packet impersonating server from session=${ws.peerId} type=${header.packetType} to=${header.toPeerId} len=${header.len}`);
         }
         return;
       }
@@ -153,18 +177,6 @@ export class RelayRoom {
 
         case PacketType.Ping:
           handlePing(ws, header, payload, this.ctx);
-          break;
-
-        case PacketType.Pong:
-          ws.lastPongReceived = Date.now();
-          // 用本次 Ping 的发送时间估算中继↔客户端 RTT，异常值（非正数或超过超时）丢弃
-          if (ws.lastPingSent) {
-            const rtt = ws.lastPongReceived - ws.lastPingSent;
-            if (rtt > 0 && rtt <= this.config.connectionTimeoutMs) {
-              ws.rttMs = rtt;
-            }
-          }
-          this._updateAttachment(ws);
           break;
 
         case PacketType.RpcReq:
@@ -239,7 +251,20 @@ export class RelayRoom {
         continue;
       }
 
-      if (now - (ws.lastPingSent || 0) >= this.config.heartbeatIntervalMs) {
+      // 握手超时：peerId 未确定的连接不能长期挂在 DO 上（匿名连接会占用配额）
+      if (!ws.peerId && now - (ws.firstSeenAt || now) > this.config.handshakeTimeoutMs) {
+        if (this.config.debug) console.warn(`[handshake] timeout session=${ws.serverSessionId}`);
+        await this.webSocketClose(ws);
+        try {
+          ws.close(CloseCode.HandshakeTimeout, 'handshake timeout');
+        } catch (_) {
+          // 已经关闭
+        }
+        continue;
+      }
+
+      // 未完成握手的连接不发心跳，直接交给上面的握手超时处理
+      if (ws.peerId && now - (ws.lastPingSent || 0) >= this.config.heartbeatIntervalMs) {
         this._sendPing(ws);
       }
 
@@ -255,6 +280,14 @@ export class RelayRoom {
 
       // 顺便把统计计数写回附件（最多滞后一个心跳周期），避免休眠唤醒后丢失
       this._updateAttachment(ws);
+    }
+
+    // 路由同步补偿：3 秒未收到 ack 或有遗留脏标记时重发。
+    // 放在 alarm 里，这样休眠唤醒后也能自动补发，不依赖客户端主动请求。
+    try {
+      this.pm.maintainRouteSync(now);
+    } catch (e) {
+      console.error('[alarm] maintainRouteSync failed:', e);
     }
 
     if (this.state.getWebSockets().length > 0) {
@@ -304,6 +337,8 @@ export class RelayRoom {
     ws.serverSessionId = meta.serverSessionId || randomU64String();
     ws.weAreInitiator = false;
     ws.lastSeen = Date.now();
+    // 握手计时起点：只有完成握手（peerId 确定）后才会参与超时检查
+    ws.firstSeenAt = meta.firstSeenAt || Date.now();
     ws.lastPingSent = 0;
     // 没有历史 pong 记录时以当前时间起算，避免旧实现里 0 值导致的“永久免死”
     ws.lastPongReceived = meta.lastPongAt || Date.now();
@@ -324,6 +359,25 @@ export class RelayRoom {
       connectedAt: st.connectedAt || Date.now(),
     };
 
+    // 出向 1 秒窗口限速，与入向令牌桶对称；窗口计数不需要跨休眠保留
+    ws.outLimit = {
+      bytesPerSecond: this.config.maxOutBytesPerSecond,
+      framesPerSecond: this.config.maxOutFramesPerSecond,
+    };
+    ws.outWindowAt = 0;
+    ws.outBytes = 0;
+    ws.outFrames = 0;
+
+    // 路由同步状态随附件持久化：唤醒后若仍处于 inFlight，alarm 会判定超时并强制重发
+    const rs = meta.routeSync || null;
+    ws.routeSync = {
+      inFlight: !!(rs && rs.inFlight),
+      dirty: !!(rs && rs.dirty),
+      forceFull: !!(rs && rs.forceFull),
+      sentAt: (rs && rs.sentAt) || 0,
+      lastCompletedAt: (rs && rs.lastCompletedAt) || 0,
+    };
+
     if (ws.peerId) this.pm.addPeer(ws.peerId, ws);
     return ws;
   }
@@ -337,7 +391,18 @@ export class RelayRoom {
         domainName: ws.domainName || null,
         serverSessionId: ws.serverSessionId || null,
         lastPongAt: ws.lastPongReceived || Date.now(),
+        firstSeenAt: ws.firstSeenAt || Date.now(),
         rttMs: ws.rttMs || 0,
+        // 路由同步状态：随附件持久化，休眠唤醒后据此补发/重试
+        routeSync: ws.routeSync
+          ? {
+            inFlight: ws.routeSync.inFlight,
+            dirty: ws.routeSync.dirty,
+            forceFull: ws.routeSync.forceFull,
+            sentAt: ws.routeSync.sentAt,
+            lastCompletedAt: ws.routeSync.lastCompletedAt,
+          }
+          : undefined,
         // 计数随附件一起持久化，休眠唤醒后不会归零
         stats: ws.stats
           ? {

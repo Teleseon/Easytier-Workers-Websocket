@@ -8,7 +8,7 @@
  * @file basic_handlers.js
  */
 
-import { MAGIC, VERSION, MY_PEER_ID, PacketType } from './constants.js';
+import { MAGIC, VERSION, MY_PEER_ID, PacketType, CloseCode } from './constants.js';
 import { createHeader } from './packet.js';
 import { wrapPacket, randomU64String, sendWithStats } from './crypto.js';
 
@@ -36,37 +36,37 @@ function handleHandshake(ws, header, payload, ctx) {
   try {
     req = types.HandshakeRequest.decode(payload);
   } catch (e) {
-    ws.close(1002, 'Bad handshake');
+    ws.close(CloseCode.Unauthorized, 'Bad handshake');
     return false;
   }
 
   if (req.magic !== MAGIC) {
-    ws.close(1008, 'Magic mismatch');
+    ws.close(CloseCode.Unauthorized, 'Magic mismatch');
     return false;
   }
 
   // 拒绝客户端自称服务端 ID 或使用无效 ID
   if (!req.myPeerId || req.myPeerId === MY_PEER_ID) {
-    ws.close(1008, 'Invalid peer id');
+    ws.close(CloseCode.Unauthorized, 'Invalid peer id');
     return false;
   }
 
   const clientNetworkName = req.networkName || '';
   if (clientNetworkName.length > 64) {
-    ws.close(1008, 'Network name too long');
+    ws.close(CloseCode.Unauthorized, 'Network name too long');
     return false;
   }
 
   // 私有模式：配置了网络名就只接受同名客户端
   if (config.networkName && clientNetworkName !== config.networkName) {
-    ws.close(1008, 'Network name mismatch');
+    ws.close(CloseCode.NetworkRejected, 'Network name mismatch');
     return false;
   }
 
   // 密钥摘要必须是固定 32 字节（或完全不提供），否则无法作为稳定的分组标识，
   // 同时避免任意长度的摘要进入 groupKey 与日志
   if (req.networkSecretDigrest && req.networkSecretDigrest.length !== 32) {
-    ws.close(1008, 'Invalid network secret digest');
+    ws.close(CloseCode.Unauthorized, 'Invalid network secret digest');
     return false;
   }
 
@@ -107,7 +107,7 @@ function handleHandshake(ws, header, payload, ctx) {
   if (!ws.serverSessionId) ws.serverSessionId = randomU64String();
   if (ws.weAreInitiator === undefined) ws.weAreInitiator = false;
 
-  pm.pushRouteUpdateTo(req.myPeerId, ws, types, { forceFull: true });
+  pm.queueRouteUpdate(ws, types, { forceFull: true });
   // 广播时排除新节点，避免它同一轮收到两份全量路由
   pm.broadcastRouteUpdate(types, ws.groupKey, req.myPeerId, { forceFull: true });
 

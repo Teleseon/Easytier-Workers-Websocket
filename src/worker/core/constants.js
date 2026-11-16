@@ -18,3 +18,12 @@ export const PacketType = {
   KcpSrc: 11,
   KcpDst: 12,
 };
+
+/**
+ * 应用自定义关闭码（4400-4999 段），便于客户端与日志区分断线原因。
+ */
+export const CloseCode = {
+  Unauthorized: 4401, // 握手非法：magic 不符、peerId 非法、密钥摘要非法
+  NetworkRejected: 4403, // 网络名不匹配（私有模式）或网络未配置
+  HandshakeTimeout: 4408, // 超过握手超时仍未完成握手
+};

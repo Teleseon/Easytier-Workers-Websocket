@@ -1,6 +1,6 @@
 // Cloudflare Worker 入口：把 WebSocket 请求路由到 Durable Object
 import { RelayRoom } from './worker/relay_room.js';
-import { loadConfig, matchesWsPath } from './worker/core/config.js';
+import { loadConfig, matchesWsPath, validateConfig } from './worker/core/config.js';
 
 export { RelayRoom };
 
@@ -33,9 +33,21 @@ async function tokenMatches(provided, expected) {
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
+    const config = loadConfig(env);
 
     if (url.pathname === '/healthz') {
-      return new Response('ok', { status: 200 });
+      // 配置自检：写错的环境变量在启动阶段就暴露为 503，避免线上只看到 ok 却连不上
+      const errors = validateConfig(config, env);
+      if (errors.length > 0) {
+        return new Response(JSON.stringify({ ok: false, errors }), {
+          status: 503,
+          headers: {
+            'Content-Type': 'application/json; charset=utf-8',
+            'Cache-Control': 'no-store',
+          },
+        });
+      }
+      return new Response('ok', { status: 200, headers: { 'Cache-Control': 'no-store' } });
     }
 
     // 负载统计：未配置 EASYTIER_STATS_TOKEN 时视为未启用，直接 404（不泄露该接口存在）
@@ -70,7 +82,6 @@ export default {
       });
     }
 
-    const config = loadConfig(env);
     if (!matchesWsPath(config, url.pathname)) {
       return new Response('Not found', { status: 404 });
     }

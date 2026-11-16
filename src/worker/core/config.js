@@ -10,6 +10,8 @@
  * @file config.js
  */
 
+import { HEADER_SIZE } from './constants.js';
+
 function toInt(value, fallback) {
   const n = Number(value);
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
@@ -27,6 +29,9 @@ export function loadConfig(env = {}) {
 
     heartbeatIntervalMs: toInt(env.EASYTIER_HEARTBEAT_INTERVAL, 10_000),
     connectionTimeoutMs: toInt(env.EASYTIER_CONNECTION_TIMEOUT, 25_000),
+    // 握手超时：超过该时间仍未完成握手（peerId 未确定）的连接直接关闭，
+    // 避免匿名半开连接长期占用 DO 资源
+    handshakeTimeoutMs: toInt(env.EASYTIER_HANDSHAKE_TIMEOUT, 10_000),
 
     // 私有网络模式：非空时只接受同名网络
     networkName: typeof env.EASYTIER_NETWORK_NAME === 'string' ? env.EASYTIER_NETWORK_NAME.trim() : '',
@@ -52,6 +57,9 @@ export function loadConfig(env = {}) {
     maxPeersPerGroup: toInt(env.EASYTIER_MAX_PEERS_PER_GROUP, 512),
     // 单连接吞吐上限（字节/秒），超出部分丢弃而不断开连接
     maxBytesPerSecond: toInt(env.EASYTIER_MAX_BYTES_PER_SEC, 16 * 1024 * 1024),
+    // 出向 1 秒窗口上限：字节数与帧数双限，超限报文直接丢弃，避免慢客户端把 DO 拖垮
+    maxOutBytesPerSecond: toInt(env.EASYTIER_MAX_OUT_BYTES_PER_SEC, 32 * 1024 * 1024),
+    maxOutFramesPerSecond: toInt(env.EASYTIER_MAX_OUT_FRAMES_PER_SEC, 4096),
     // 单次上报的直连节点数上限，以及 PeerCenter 全局表条目上限
     maxDirectPeersPerReport: toInt(env.EASYTIER_MAX_DIRECT_PEERS, 256),
     maxPeerCenterEntries: toInt(env.EASYTIER_MAX_PEER_CENTER_ENTRIES, 4096),
@@ -68,4 +76,73 @@ export function matchesWsPath(config, pathname) {
   if (!config.wsPath) return true;
   const path = pathname.replace(/\/+$/, '') || '/';
   return path === config.wsPath;
+}
+
+/** 合法的 Cloudflare 地域提示（写错会被静默忽略，所以要在自检里拦下） */
+const LOCATION_HINTS = new Set(['wnam', 'enam', 'sam', 'weur', 'eeur', 'apac', 'oc', 'afr', 'me']);
+
+/** 数值型环境变量：留空视为未配置，非数字或非正数视为写错 */
+function invalidIntEnv(env, key) {
+  const raw = env[key];
+  if (raw === undefined || raw === null || raw === '') return false;
+  const n = Number(raw);
+  return !Number.isFinite(n) || n <= 0 || Math.floor(n) !== n;
+}
+
+/**
+ * 配置自检：返回错误列表，空数组表示配置可用。
+ *
+ * 只校验"配错必然导致故障或静默失效"的项，供 /healthz 在启动前暴露问题，
+ * 避免线上只看到 /healthz 永远是 ok、实际却连不上。
+ *
+ * @param {object} config loadConfig() 的结果
+ * @param {object} env 原始环境变量
+ * @returns {string[]}
+ */
+export function validateConfig(config, env = {}) {
+  const errors = [];
+
+  const numericKeys = [
+    'EASYTIER_HEARTBEAT_INTERVAL',
+    'EASYTIER_CONNECTION_TIMEOUT',
+    'EASYTIER_HANDSHAKE_TIMEOUT',
+    'EASYTIER_MAX_MESSAGE_BYTES',
+    'EASYTIER_MAX_PEERS_PER_GROUP',
+    'EASYTIER_MAX_BYTES_PER_SEC',
+    'EASYTIER_MAX_OUT_BYTES_PER_SEC',
+    'EASYTIER_MAX_OUT_FRAMES_PER_SEC',
+    'EASYTIER_SESSION_TTL_MS',
+    'EASYTIER_PEER_CENTER_TTL_MS',
+  ];
+  for (const key of numericKeys) {
+    if (invalidIntEnv(env, key)) errors.push(`${key} 必须是正整数`);
+  }
+
+  if (config.connectionTimeoutMs <= config.heartbeatIntervalMs) {
+    errors.push('EASYTIER_CONNECTION_TIMEOUT 必须大于 EASYTIER_HEARTBEAT_INTERVAL，否则心跳没发完就会被判定超时');
+  }
+  if (config.handshakeTimeoutMs < 1000) {
+    errors.push('EASYTIER_HANDSHAKE_TIMEOUT 不能小于 1000 毫秒');
+  }
+  if (config.maxMessageBytes < HEADER_SIZE || config.maxMessageBytes > 16 * 1024 * 1024) {
+    errors.push(`EASYTIER_MAX_MESSAGE_BYTES 必须在 ${HEADER_SIZE} 到 16777216 之间`);
+  }
+  if (config.maxPeersPerGroup < 1 || config.maxPeersPerGroup > 4096) {
+    errors.push('EASYTIER_MAX_PEERS_PER_GROUP 必须在 1 到 4096 之间');
+  }
+
+  if (config.wsPath && !/^\/[A-Za-z0-9_\-/]*$/.test(config.wsPath)) {
+    errors.push('WS_PATH 只能包含字母、数字、下划线、短横线和斜杠');
+  }
+
+  const hint = typeof env.LOCATION_HINT === 'string' ? env.LOCATION_HINT.trim() : '';
+  if (hint && !LOCATION_HINTS.has(hint)) {
+    errors.push(`LOCATION_HINT 不是合法的地域码：${hint}（可选 ${[...LOCATION_HINTS].join('/')}）`);
+  }
+
+  if (!env.RELAY_ROOM || typeof env.RELAY_ROOM.idFromName !== 'function') {
+    errors.push('缺少 RELAY_ROOM Durable Object 绑定');
+  }
+
+  return errors;
 }

@@ -333,7 +333,7 @@ function handleSyncRouteInfo(ws, fromPeerId, reqRpcPacket, syncReq, ctx) {
 
   // 回推当前路由（与官方节点行为一致）
   try {
-    pm.pushRouteUpdateTo(fromPeerId, ws, types, { forceFull: true });
+    pm.queueRouteUpdate(ws, types, { forceFull: true });
   } catch (e) {
     if (config.debug) console.warn(`[rpc] push route update to ${fromPeerId} failed: ${e.message}`);
   }

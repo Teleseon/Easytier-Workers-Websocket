@@ -18,6 +18,8 @@ import { createHeader } from './packet.js';
 import { wrapPacket, randomU64String, sendWithStats } from './crypto.js';
 
 const WS_OPEN = 1;
+// 路由同步请求在途超时：超时未收到 SyncRouteInfoResponse 就强制全量重发
+const ROUTE_SYNC_TIMEOUT_MS = 3000;
 
 function randomUint32() {
   return Math.floor(Math.random() * 4294967296);
@@ -188,6 +190,103 @@ export class PeerManager {
     session.dstSessionId = theirSessionId;
     if (typeof weAreInitiator === 'boolean') {
       session.weAreInitiator = weAreInitiator;
+    }
+
+    // 收到 ack：清除在途标记；若期间又有变更，立即补发一次
+    const ws = this.getPeerWs(groupKey, peerId);
+    if (ws) {
+      const st = this._routeSyncState(ws);
+      st.inFlight = false;
+      st.lastCompletedAt = Date.now();
+      if (st.dirty || st.forceFull) this.flushRouteUpdate(ws, this.types);
+    }
+  }
+
+  /**
+   * 每条连接的路由同步状态。
+   * 该对象挂在 ws 上，并随 attachment 持久化（见 relay_room._updateAttachment），
+   * 因此 Durable Object 休眠唤醒后仍能判断是否有请求在途。
+   */
+  _routeSyncState(ws) {
+    if (!ws.routeSync) {
+      ws.routeSync = {
+        inFlight: false,
+        dirty: false,
+        forceFull: false,
+        sentAt: 0,
+        lastCompletedAt: 0,
+      };
+    }
+    return ws.routeSync;
+  }
+
+  /**
+   * 标记该连接需要同步路由，并尽量立即发送。
+   * 已有请求在途时只置脏标记，等 ack 回来再合并发送，避免重复全量。
+   */
+  queueRouteUpdate(ws, types, opts = {}) {
+    if (!ws || ws.readyState !== WS_OPEN) return false;
+    const st = this._routeSyncState(ws);
+    st.dirty = true;
+    if (opts.forceFull) st.forceFull = true;
+    return st.inFlight ? false : this.flushRouteUpdate(ws, types);
+  }
+
+  /**
+   * 发送一次路由同步。
+   * 发送失败（如被出向限速丢弃）时保留脏标记，等 alarm 补偿重试。
+   */
+  flushRouteUpdate(ws, types) {
+    if (!ws || ws.readyState !== WS_OPEN || !ws.peerId) return false;
+    const st = this._routeSyncState(ws);
+    if (st.inFlight) return false;
+
+    const forceFull = st.forceFull;
+    st.dirty = false;
+    st.forceFull = false;
+
+    let sent = false;
+    try {
+      sent = this.pushRouteUpdateTo(ws.peerId, ws, types, { forceFull });
+    } catch (e) {
+      if (this.config.debug) {
+        console.warn(`[RouteUpdate] flush to ${ws.peerId} failed: ${e.message}`);
+      }
+    }
+
+    if (!sent) {
+      st.dirty = true;
+      st.forceFull = st.forceFull || forceFull;
+      return false;
+    }
+
+    st.inFlight = true;
+    st.sentAt = Date.now();
+    return true;
+  }
+
+  /** alarm 周期调用：补发脏标记，超时未 ack 的请求强制全量重发 */
+  maintainRouteSync(nowTs = Date.now()) {
+    if (!this.types) return;
+
+    for (const [, peers] of this.peersByGroup.entries()) {
+      for (const [, ws] of peers.entries()) {
+        if (!ws || ws.readyState !== WS_OPEN) continue;
+        const st = this._routeSyncState(ws);
+
+        if (st.inFlight && nowTs - st.sentAt > ROUTE_SYNC_TIMEOUT_MS) {
+          if (this.config.debug) {
+            console.warn(`[RouteUpdate] ack timeout peer=${ws.peerId}, retry full`);
+          }
+          st.inFlight = false;
+          st.forceFull = true;
+          st.dirty = true;
+        }
+
+        if (!st.inFlight && (st.dirty || st.forceFull)) {
+          this.flushRouteUpdate(ws, this.types);
+        }
+      }
     }
   }
 
@@ -400,7 +499,7 @@ export class PeerManager {
         if (peerId === excludePeerId) continue;
         if (ws.readyState !== WS_OPEN) continue;
         try {
-          this.pushRouteUpdateTo(peerId, ws, types, { forceFull });
+          this.queueRouteUpdate(ws, types, { forceFull });
         } catch (e) {
           if (this.config.debug) {
             console.warn(`[RouteUpdate] push to ${peerId} failed: ${e.message}`);
@@ -416,7 +515,7 @@ export class PeerManager {
     const forceFull = !!opts.forceFull;
     const groupKey = ws && ws.groupKey ? String(ws.groupKey) : '';
     const session = this._getSession(groupKey, targetPeerId, true);
-    if (!session) return;
+    if (!session) return false;
 
     const myInfo = this.ensureMyInfo();
     if (!ws.serverSessionId) ws.serverSessionId = randomU64String();
@@ -521,7 +620,7 @@ export class PeerManager {
     };
 
     const rpcPacketBytes = types.RpcPacket.encode(rpcReqPacket).finish();
-    sendWithStats(ws, wrapPacket(createHeader, MY_PEER_ID, targetPeerId, PacketType.RpcReq, rpcPacketBytes, ws));
+    return sendWithStats(ws, wrapPacket(createHeader, MY_PEER_ID, targetPeerId, PacketType.RpcReq, rpcPacketBytes, ws));
   }
 
   _makeStubPeerInfo(peerId, networkLength) {

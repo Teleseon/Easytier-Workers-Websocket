@@ -40,16 +40,46 @@ export function wrapPacket(createHeader, fromPeerId, toPeerId, packetType, paylo
 }
 
 /**
+ * 出向 1 秒滚动窗口限速：同时限制字节数与帧数。
+ *
+ * 超限返回 false，由调用方直接丢弃该报文（不断连接）。
+ * 目的是防止慢客户端（ws.send 缓冲暴涨）或广播风暴把 Durable Object 的内存拖爆。
+ */
+function allowOutbound(ws, bytes) {
+  const limit = ws.outLimit;
+  if (!limit) return true;
+
+  const now = Date.now();
+  if (!ws.outWindowAt || now - ws.outWindowAt >= 1000) {
+    ws.outWindowAt = now;
+    ws.outBytes = 0;
+    ws.outFrames = 0;
+  }
+
+  if (ws.outBytes + bytes > limit.bytesPerSecond) return false;
+  if (ws.outFrames + 1 > limit.framesPerSecond) return false;
+
+  ws.outBytes += bytes;
+  ws.outFrames += 1;
+  return true;
+}
+
+/**
  * 发送报文并累计出向流量。
  *
- * ws.stats 由 relay_room 在连接建立（或休眠恢复）时初始化；
- * 统计失败不应影响正常发送，因此单独 try 包裹。
+ * ws.stats / ws.outLimit 由 relay_room 在连接建立（或休眠恢复）时初始化；
+ * 被限速丢弃的报文不计数，也不发送。
+ *
+ * @returns {boolean} 是否真正写出
  */
 export function sendWithStats(ws, data) {
+  let bytes = 0;
+  if (typeof data === 'string') bytes = new TextEncoder().encode(data).length;
+  else if (data && data.byteLength !== undefined) bytes = data.byteLength;
+
+  if (!allowOutbound(ws, bytes)) return false;
+
   try {
-    let bytes = 0;
-    if (typeof data === 'string') bytes = new TextEncoder().encode(data).length;
-    else if (data && data.byteLength !== undefined) bytes = data.byteLength;
     ws.stats.msgsOut += 1;
     ws.stats.bytesOut += bytes;
   } catch (_) {
