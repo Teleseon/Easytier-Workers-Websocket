@@ -181,7 +181,7 @@ curl -o NUL -s -w "%{time_total}\n" https://你的域名/healthz
 | `EASYTIER_DISABLE_RELAY` | `0` | `1` 开启纯 P2P，不转发 Data 包 |
 | `EASYTIER_FULL_MESH` | `0` | `1` 强制下发全互联位图（复现旧版行为，仅排查用；会导致打洞后流量仍走中继） |
 | `EASYTIER_DEBUG` | `0` | `1` 输出逐包调试日志（会明显拉高延迟，生产勿开） |
-| `LOCATION_HINT` | `apac` | Durable Object 部署区域 |
+| `LOCATION_HINT` | `wnam` | Durable Object 部署区域 |
 | `EASYTIER_OSPF_ROUTE_METHOD_INDEX` | `1` | 下发给客户端的路由方法索引 |
 | `EASYTIER_HANDSHAKE_MODE` | `foreign` | 握手时的网络名回填策略 |
 | `EASYTIER_PEER_CENTER_TTL_MS` | `180000` | PeerCenter 缓存过期时间 |
