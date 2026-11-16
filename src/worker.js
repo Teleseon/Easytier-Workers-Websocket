@@ -21,7 +21,9 @@ export default {
       return new Response('Expected WebSocket upgrade', { status: 400 });
     }
 
-    const roomId = url.searchParams.get('room') || 'default';
+    // room 只允许安全字符，避免用畸形值映射到任意 Durable Object 实例名
+    const rawRoom = url.searchParams.get('room') || 'default';
+    const roomId = /^[A-Za-z0-9_-]{1,64}$/.test(rawRoom) ? rawRoom : 'default';
     const options = env.LOCATION_HINT ? { locationHint: env.LOCATION_HINT } : {};
     const roomStub = env.RELAY_ROOM.get(env.RELAY_ROOM.idFromName(roomId), options);
     return roomStub.fetch(request);

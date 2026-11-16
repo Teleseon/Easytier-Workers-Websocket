@@ -50,6 +50,11 @@ export function loadConfig(env = {}) {
     // 防护上限
     maxMessageBytes: toInt(env.EASYTIER_MAX_MESSAGE_BYTES, 1024 * 1024),
     maxPeersPerGroup: toInt(env.EASYTIER_MAX_PEERS_PER_GROUP, 512),
+    // 单连接吞吐上限（字节/秒），超出部分丢弃而不断开连接
+    maxBytesPerSecond: toInt(env.EASYTIER_MAX_BYTES_PER_SEC, 16 * 1024 * 1024),
+    // 单次上报的直连节点数上限，以及 PeerCenter 全局表条目上限
+    maxDirectPeersPerReport: toInt(env.EASYTIER_MAX_DIRECT_PEERS, 256),
+    maxPeerCenterEntries: toInt(env.EASYTIER_MAX_PEER_CENTER_ENTRIES, 4096),
 
     debug: env.EASYTIER_DEBUG === '1',
   };

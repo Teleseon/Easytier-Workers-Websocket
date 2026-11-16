@@ -135,17 +135,44 @@ export function handleRpcReq(ws, header, payload, ctx) {
 
       if (descriptor.methodIndex === 0) {
         const req = types.ReportPeersRequest.decode(innerReqBody);
+
+        // 不允许替其它节点上报，否则可以污染他人名下的直连信息
+        if (req.myPeerId && Number(req.myPeerId) !== Number(header.fromPeerId)) {
+          if (config.debug) {
+            console.warn(`[rpc] rejected spoofed ReportPeersRequest myPeerId=${req.myPeerId} from=${header.fromPeerId}`);
+          }
+          return;
+        }
+
         const peers = req.peerInfos || { directPeers: {} };
 
+        // 限制单次上报的条目数，防止超大报文把全局表撑爆
         const directPeers = {};
-        if (peers.directPeers) {
-          for (const [dstPeerId, info] of Object.entries(peers.directPeers)) {
-            directPeers[String(dstPeerId)] = {
-              latencyMs: (info && typeof info.latencyMs === 'number') ? info.latencyMs : 0,
-            };
-          }
+        const entries = Object.entries(peers.directPeers || {});
+        const limit = Math.min(entries.length, config.maxDirectPeersPerReport);
+        for (let i = 0; i < limit; i++) {
+          const [dstPeerId, info] = entries[i];
+          directPeers[String(dstPeerId)] = {
+            latencyMs: (info && typeof info.latencyMs === 'number') ? info.latencyMs : 0,
+          };
         }
-        state.globalPeerMap.set(String(req.myPeerId), { directPeers, lastSeen: Date.now() });
+
+        const selfKey = String(req.myPeerId);
+        if (!state.globalPeerMap.has(selfKey) && state.globalPeerMap.size >= config.maxPeerCenterEntries) {
+          // 超出上限时淘汰最久未更新的条目，保证内存有界
+          let oldestKey = null;
+          let oldest = Infinity;
+          for (const [k, v] of state.globalPeerMap.entries()) {
+            const seen = v.lastSeen || 0;
+            if (seen < oldest) {
+              oldest = seen;
+              oldestKey = k;
+            }
+          }
+          if (oldestKey !== null) state.globalPeerMap.delete(oldestKey);
+        }
+
+        state.globalPeerMap.set(selfKey, { directPeers, lastSeen: Date.now() });
 
         // 旧代码这里漏传 pm，抛 TypeError 后整个 RPC 静默失败
         const snapshot = buildPeerCenterResponseMap(groupKey, state, pm);

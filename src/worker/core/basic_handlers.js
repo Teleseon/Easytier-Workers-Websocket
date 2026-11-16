@@ -52,10 +52,21 @@ function handleHandshake(ws, header, payload, ctx) {
   }
 
   const clientNetworkName = req.networkName || '';
+  if (clientNetworkName.length > 64) {
+    ws.close(1008, 'Network name too long');
+    return false;
+  }
 
   // 私有模式：配置了网络名就只接受同名客户端
   if (config.networkName && clientNetworkName !== config.networkName) {
     ws.close(1008, 'Network name mismatch');
+    return false;
+  }
+
+  // 密钥摘要必须是固定 32 字节（或完全不提供），否则无法作为稳定的分组标识，
+  // 同时避免任意长度的摘要进入 groupKey 与日志
+  if (req.networkSecretDigrest && req.networkSecretDigrest.length !== 32) {
+    ws.close(1008, 'Invalid network secret digest');
     return false;
   }
 

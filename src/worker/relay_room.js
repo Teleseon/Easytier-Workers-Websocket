@@ -105,6 +105,24 @@ export class RelayRoom {
       ws.lastSeen = Date.now();
       const payload = buffer.subarray(HEADER_SIZE);
 
+      // 单连接吞吐上限：超出预算的报文直接丢弃（不断连接），避免一条连接打满 DO
+      if (!this._allowBytes(ws, buffer.length)) return;
+
+      // 未完成握手的连接只允许发握手包，防止匿名连接直接向其它节点注入流量
+      if (!ws.peerId && header.packetType !== PacketType.HandShake) {
+        return;
+      }
+
+      // 禁止冒充服务端身份：客户端之间会互相转发其它节点的报文（fromPeerId 可以不是自己），
+      // 所以不能要求 fromPeerId 等于本连接的身份，但任何情况下都不允许使用服务端 MY_PEER_ID，
+      // 否则可以伪造控制面报文（路由同步 / RPC 响应）影响其它节点。
+      if (Number(header.fromPeerId) === MY_PEER_ID) {
+        if (this.config.debug) {
+          console.warn(`[ws] dropped packet impersonating server from session=${ws.peerId}`);
+        }
+        return;
+      }
+
       if (this.config.debug) {
         console.log(`[ws] from=${header.fromPeerId} to=${header.toPeerId} type=${header.packetType} len=${header.len}`);
       }
@@ -113,6 +131,11 @@ export class RelayRoom {
 
       switch (header.packetType) {
         case PacketType.HandShake:
+          // 已握手的连接不允许再次握手，否则可借机切换分组绕过连接数上限
+          if (ws.peerId) {
+            ws.close(1008, 'Duplicate handshake');
+            break;
+          }
           if (handleHandshake(ws, header, payload, this.ctx)) {
             this._updateAttachment(ws);
           }
@@ -265,6 +288,9 @@ export class RelayRoom {
     // 没有历史 pong 记录时以当前时间起算，避免旧实现里 0 值导致的“永久免死”
     ws.lastPongReceived = meta.lastPongAt || Date.now();
     ws.relayFlags = this.config.latencyFirst ? 0x02 : 0;
+    // 令牌桶：桶容量 = 2 秒的预算，允许短时突发，但持续超速会被丢弃
+    ws.bucket = 0;
+    ws.bucketAt = 0;
 
     if (ws.peerId) this.pm.addPeer(ws.peerId, ws);
     return ws;
@@ -283,6 +309,29 @@ export class RelayRoom {
     } catch (e) {
       if (this.config.debug) console.warn('[ws] serializeAttachment failed:', e.message);
     }
+  }
+
+  /**
+   * 令牌桶限速：返回 true 表示本次报文放行。
+   * 只丢包不断连接，避免瞬时突发导致客户端整体掉线。
+   */
+  _allowBytes(ws, bytes) {
+    const rate = this.config.maxBytesPerSecond;
+    if (!rate) return true;
+
+    const now = Date.now();
+    const cap = rate * 2;
+    if (!ws.bucketAt) {
+      ws.bucket = cap;
+      ws.bucketAt = now;
+    } else if (now > ws.bucketAt) {
+      ws.bucket = Math.min(cap, ws.bucket + ((now - ws.bucketAt) * rate) / 1000);
+      ws.bucketAt = now;
+    }
+
+    if (ws.bucket < bytes) return false;
+    ws.bucket -= bytes;
+    return true;
   }
 
   /**

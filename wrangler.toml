@@ -41,6 +41,13 @@ EASYTIER_HEARTBEAT_INTERVAL = "10000" # 10秒发一次心跳
 EASYTIER_CONNECTION_TIMEOUT = "25000" # 25秒无响应则踢出
 EASYTIER_SESSION_TTL_MS = "180000"
 
+# 单连接吞吐上限（字节/秒），超出部分丢弃且不断连
+EASYTIER_MAX_BYTES_PER_SEC = "16777216"
+
+# PeerCenter 上报与全局表上限，防止被大量伪造节点撑爆内存
+EASYTIER_MAX_DIRECT_PEERS = "256"
+EASYTIER_MAX_PEER_CENTER_ENTRIES = "4096"
+
 [durable_objects]
 bindings = [
   { name = "RELAY_ROOM", class_name = "RelayRoom" }
