@@ -226,18 +226,19 @@ curl -H "Authorization: Bearer 你的令牌" "https://你的域名/stats?room=de
   "startedAt": 1763260000000,
   "uptimeMs": 3600000,
   "generatedAt": 1763263600000,
-  "totals": { "peerCount": 2, "bytesIn": 1048576, "bytesOut": 2097152, "msgsIn": 4096, "msgsOut": 8192 },
+  "totals": { "peerCount": 2, "latencyMs": 42, "bytesIn": 1048576, "bytesOut": 2097152, "msgsIn": 4096, "msgsOut": 8192 },
   "groups": [
-    { "group": "public_server#a1b2c3d4", "networkName": "public_server", "peerCount": 2, "bytesIn": 1048576, "bytesOut": 2097152, "msgsIn": 4096, "msgsOut": 8192 }
+    { "group": "public_server#a1b2c3d4", "networkName": "public_server", "peerCount": 2, "latencyMs": 42, "bytesIn": 1048576, "bytesOut": 2097152, "msgsIn": 4096, "msgsOut": 8192 }
   ],
   "peers": [
-    { "peerId": "123456789", "group": "public_server#a1b2c3d4", "networkName": "public_server", "connectedAt": 1763260000000, "lastSeen": 1763263599000, "bytesIn": 524288, "bytesOut": 1048576, "msgsIn": 2048, "msgsOut": 4096 }
+    { "peerId": "123456789", "group": "public_server#a1b2c3d4", "networkName": "public_server", "connectedAt": 1763260000000, "lastSeen": 1763263599000, "latencyMs": 40, "bytesIn": 524288, "bytesOut": 1048576, "msgsIn": 2048, "msgsOut": 4096 }
   ]
 }
 ```
 
 几点说明：
 
+- `latencyMs` 是中继侧 Ping/Pong 心跳采样的 RTT（毫秒），反映**客户端↔中继**的链路延迟：`totals` / `groups` 是平均值，`peers` 是该连接最近一次采样值。没有连接或还没完成一次采样时为 `0`（中继无法凭空测出到某个节点的延迟）。
 - `bytesIn` / `bytesOut` 是 WebSocket 报文大小的累计值（含中继转发的数据面），不是 Cloudflare 计费口径；`msgsIn` / `msgsOut` 是报文条数。
 - 计数随连接附件持久化（每次 alarm 心跳回写一次，最长滞后约 5 秒）；Durable Object 被重新调度后从最后一次落盘值继续，`startedAt` / `uptimeMs` 会按新实例重新计算。
 - `group` 里的密钥摘要只保留前 8 位，不把完整摘要交给调用方。

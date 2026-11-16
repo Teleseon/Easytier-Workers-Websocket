@@ -157,6 +157,13 @@ export class RelayRoom {
 
         case PacketType.Pong:
           ws.lastPongReceived = Date.now();
+          // 用本次 Ping 的发送时间估算中继↔客户端 RTT，异常值（非正数或超过超时）丢弃
+          if (ws.lastPingSent) {
+            const rtt = ws.lastPongReceived - ws.lastPingSent;
+            if (rtt > 0 && rtt <= this.config.connectionTimeoutMs) {
+              ws.rttMs = rtt;
+            }
+          }
           this._updateAttachment(ws);
           break;
 
@@ -301,6 +308,8 @@ export class RelayRoom {
     // 没有历史 pong 记录时以当前时间起算，避免旧实现里 0 值导致的“永久免死”
     ws.lastPongReceived = meta.lastPongAt || Date.now();
     ws.relayFlags = this.config.latencyFirst ? 0x02 : 0;
+    // 最近一次 Ping/Pong 采样得到的 RTT（毫秒），休眠恢复时沿用上次的值
+    ws.rttMs = meta.rttMs || 0;
     // 令牌桶：桶容量 = 2 秒的预算，允许短时突发，但持续超速会被丢弃
     ws.bucket = 0;
     ws.bucketAt = 0;
@@ -328,6 +337,7 @@ export class RelayRoom {
         domainName: ws.domainName || null,
         serverSessionId: ws.serverSessionId || null,
         lastPongAt: ws.lastPongReceived || Date.now(),
+        rttMs: ws.rttMs || 0,
         // 计数随附件一起持久化，休眠唤醒后不会归零
         stats: ws.stats
           ? {
@@ -390,13 +400,16 @@ export class RelayRoom {
     const room = url.searchParams.get('room') || 'default';
     const peers = [];
     const groups = new Map();
-    const totals = { peerCount: 0, bytesIn: 0, bytesOut: 0, msgsIn: 0, msgsOut: 0 };
+    const totals = { peerCount: 0, bytesIn: 0, bytesOut: 0, msgsIn: 0, msgsOut: 0, latencyMs: 0 };
+    let latencySum = 0;
+    let latencySamples = 0;
 
     for (const ws of this.state.getWebSockets()) {
       this._ensureSocket(ws);
       if (!ws.peerId) continue;
 
       const st = ws.stats;
+      const rtt = ws.rttMs || 0;
       const groupKey = ws.groupKey ? String(ws.groupKey) : '';
       const sep = groupKey.indexOf(':');
       const networkName = ws.domainName || (sep > 0 ? groupKey.slice(0, sep) : '');
@@ -410,6 +423,7 @@ export class RelayRoom {
         networkName,
         connectedAt: st.connectedAt,
         lastSeen: ws.lastSeen || 0,
+        latencyMs: rtt,
         bytesIn: st.bytesIn,
         bytesOut: st.bytesOut,
         msgsIn: st.msgsIn,
@@ -418,10 +432,16 @@ export class RelayRoom {
 
       let g = groups.get(group);
       if (!g) {
-        g = { group, networkName, peerCount: 0, bytesIn: 0, bytesOut: 0, msgsIn: 0, msgsOut: 0 };
+        g = { group, networkName, peerCount: 0, latencySum: 0, latencySamples: 0, bytesIn: 0, bytesOut: 0, msgsIn: 0, msgsOut: 0 };
         groups.set(group, g);
       }
       g.peerCount += 1;
+      if (rtt > 0) {
+        g.latencySum += rtt;
+        g.latencySamples += 1;
+        latencySum += rtt;
+        latencySamples += 1;
+      }
       g.bytesIn += st.bytesIn;
       g.bytesOut += st.bytesOut;
       g.msgsIn += st.msgsIn;
@@ -434,8 +454,22 @@ export class RelayRoom {
       totals.msgsOut += st.msgsOut;
     }
 
+    // 平均 RTT 只统计有 Ping/Pong 采样的连接；没有连接时保持 0（无法采样）
+    totals.latencyMs = latencySamples > 0 ? Math.round(latencySum / latencySamples) : 0;
+
     // 流量大的排在前面，方便直接看出谁在占带宽
     peers.sort((a, b) => (b.bytesIn + b.bytesOut) - (a.bytesIn + a.bytesOut));
+
+    const groupList = Array.from(groups.values()).map((g) => ({
+      group: g.group,
+      networkName: g.networkName,
+      peerCount: g.peerCount,
+      latencyMs: g.latencySamples > 0 ? Math.round(g.latencySum / g.latencySamples) : 0,
+      bytesIn: g.bytesIn,
+      bytesOut: g.bytesOut,
+      msgsIn: g.msgsIn,
+      msgsOut: g.msgsOut,
+    }));
 
     const body = {
       room,
@@ -443,7 +477,7 @@ export class RelayRoom {
       uptimeMs: now - this.startedAt,
       generatedAt: now,
       totals,
-      groups: Array.from(groups.values()),
+      groups: groupList,
       peers,
     };
     return new Response(JSON.stringify(body), {
